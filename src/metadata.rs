@@ -9,6 +9,7 @@ pub struct FileMetadata {
     pub received_at: Option<u64>,
     pub mime_type: Option<String>,
     pub size: Option<u64>,
+    pub tags: Vec<String>,
     pub sources: Vec<FileSource>,
 }
 
@@ -17,12 +18,14 @@ pub struct FileSource {
     pub host_name: String,
     pub full_file_path: Option<String>,
     pub root_folder: Option<String>,
+    pub relative_file_path: Option<String>,
     pub file_name: Option<String>,
     pub file_extension: Option<String>,
     pub received_at: Option<u64>,
     pub created_at: Option<u64>,
     pub modified_at: Option<u64>,
     pub accessed_at: Option<u64>,
+    pub last_updated_at: Option<u64>,
     pub readonly: Option<bool>
 }
 
