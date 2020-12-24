@@ -5,8 +5,10 @@ mod hash_utility;
 mod metadata;
 mod copy;
 mod utility;
+mod post;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     SimpleLogger::new().init().unwrap();
     
     let matches = App::new("Epic shelter")
@@ -21,8 +23,18 @@ fn main() {
             .arg(Arg::with_name("output-folder").long("output-folder").value_name("output folder").short("o")))
         .subcommand(SubCommand::with_name("post")
             .about("Copies files to server with http post")
-            .arg(Arg::with_name("url").long("url"))
-            .arg(Arg::with_name("input-folder").long("input-folder")))
+            .arg(
+                Arg::with_name("url")
+                    .long("url")
+                    .value_name("url")
+                    .short("h")
+                    .required(true))
+            .arg(
+                Arg::with_name("input-folder")
+                    .long("input-folder")
+                    .value_name("input-folder")
+                    .short("i").required(true))
+        )
         .get_matches();
 
     match matches.subcommand_name().unwrap() {
@@ -35,7 +47,9 @@ fn main() {
             copy::exec_copy(args);
         }
         "post" => {
-            unimplemented!()
+            let args = matches.subcommand_matches("post").unwrap();
+
+            post::exec_post(args).await;
         },
         _ => {
             panic!("What is this ??");
