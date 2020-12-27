@@ -1,7 +1,6 @@
 use clap::{App, Arg, SubCommand};
 use simple_logger::SimpleLogger;
 
-mod hash_utility;
 mod metadata;
 mod copy;
 mod utility;
@@ -9,7 +8,10 @@ mod post;
 
 #[tokio::main]
 async fn main() {
-    SimpleLogger::new().init().unwrap();
+    SimpleLogger::new()
+        .with_level(log::LevelFilter::Info)
+        .init()
+        .unwrap();
     
     let matches = App::new("Epic shelter")
         .version("0.0.1")

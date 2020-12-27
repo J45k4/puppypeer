@@ -1,13 +1,15 @@
-use std::{io::BufReader, path::Path};
+use std::{fmt::format, io::BufReader, path::Path};
 
 use clap::ArgMatches;
-use reqwest::{Body, multipart::Part};
+use futures::Stream;
+use reqwest::{Body, Client, multipart::{Form, Part}};
 use tokio::prelude::*;
 use walkdir::WalkDir;
-
+use tokio_util::codec;
+use tokio_util::codec::{Framed, BytesCodec};
 
 pub async fn exec_post(args: &ArgMatches<'_>) {
-    let url = args.value_of("url");
+    let base_url = args.value_of("url").unwrap();
     let input_folder_path_str = args.value_of("input-folder").unwrap();
 
     let input_folder_path = Path::new(input_folder_path_str);
@@ -31,11 +33,31 @@ pub async fn exec_post(args: &ArgMatches<'_>) {
 
         let file_path_str = file_path.display().to_string();
 
-        let file_handle = tokio::fs::File::open(file_path);
+        let file_handle = tokio::fs::File::open(file_path).await.unwrap();
 
-        let mut reader = BufReader::new(file_handle);
+        let framed = Framed::new(file_handle, BytesCodec::new());
 
-        Part::stream(Body::wrap_stream(file_handle.);
+        let body = Body::wrap_stream(framed);
+    
+        let file_name = file_path.file_name()
+            .unwrap().to_str().unwrap().to_string();
+
+        let s = Part::stream(body).file_name(file_name);
+    
+        let form = Form::new()
+            .part("file", s);
+
+        let client = Client::new();
+
+        let hash = common::calc_file_hash(&file_path_str).unwrap();
+
+        let url = format!("{}/v1/file/{}/content", base_url, hash);
+
+        log::info!("Posting file to {}", url);
+
+        client.post(&url)
+            .multipart(form)
+            .send().await.unwrap();
     }
 
 

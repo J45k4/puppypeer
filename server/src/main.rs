@@ -1,8 +1,14 @@
 use std::io::Write;
 
 use actix_multipart::Multipart;
-use actix_web::{middleware, web, App, Error, HttpResponse, HttpServer};
+use actix_web::{App, Error, HttpRequest, HttpResponse, HttpServer, middleware, web};
 use futures::{StreamExt, TryStreamExt};
+
+use actix_web::{post, get};
+use simple_logger::SimpleLogger;
+
+mod handlers;
+mod config;
 
 async fn save_file(mut payload: Multipart) -> Result<HttpResponse, Error> {
     // iterate over multipart stream
@@ -54,8 +60,14 @@ fn index() -> HttpResponse {
     HttpResponse::Ok().body(html)
 }
 
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    SimpleLogger::new()
+        .with_level(log::LevelFilter::Info)
+        .init()
+        .unwrap();
+
     std::env::set_var("RUST_LOG", "actix_server=info,actix_web=info");
     std::fs::create_dir_all("./tmp").unwrap();
 
@@ -68,8 +80,11 @@ async fn main() -> std::io::Result<()> {
                 .route(web::post().to(save_file)),
         ).service(
             web::resource("/ping")
-                .route(web::get().to(ping)
-        ))
+                .route(web::get().to(ping)),
+        ).service(
+            web::resource("/v1/file/")
+        ).service(handlers::get_file_metadata)
+        .service(handlers::post_file_content)
     })
     .bind(ip)?
     .run()
