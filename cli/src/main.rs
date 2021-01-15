@@ -1,7 +1,6 @@
 use clap::{App, Arg, SubCommand};
 use simple_logger::SimpleLogger;
 
-mod metadata;
 mod copy;
 mod utility;
 mod post;

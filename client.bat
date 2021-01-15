@@ -1,0 +1,1 @@
+.\target\debug\epic-shelter.exe post --url http://localhost:45000 --input-folder H:\Pictures1\Telegram

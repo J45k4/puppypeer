@@ -1,8 +1,8 @@
 use std::{fs::{copy, create_dir_all}, path::Path, process::exit};
 
 use clap::ArgMatches;
+use common::metadata::{FileMetadata, FileSource};
 use gethostname::gethostname;
-use metadata::FileSource;
 use tree_magic::from_filepath;
 use utility::{get_current_timestamp, get_millis_timestamp};
 use walkdir::WalkDir;
@@ -57,7 +57,7 @@ pub fn exec_copy(args: &ArgMatches) {
     
         let metadata_file_path_str = metadata_file_path.to_str().unwrap();
 
-        let mut file_metadata = metadata::FileMetadata::get_or_create(metadata_file_path_str);        
+        let mut file_metadata = FileMetadata::get_or_create(metadata_file_path_str);        
 
         let size = metadata.len();
         let modified = get_millis_timestamp(metadata.modified().unwrap()).unwrap();

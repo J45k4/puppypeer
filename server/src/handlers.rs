@@ -1,6 +1,6 @@
 use actix_multipart::Multipart;
 use actix_web::{App, Error, HttpRequest, HttpResponse, HttpServer, middleware, web};
-use common::provide_file_handle;
+use common::{metadata::FileMetadata, provide_file_handle};
 use futures::{StreamExt, TryStreamExt};
 use tokio::io::{self, AsyncWriteExt};
 use std::io::Write;
@@ -8,7 +8,7 @@ use std::io::Write;
 use actix_web::{post, get};
 use tokio::fs::File;
 
-use crate::config::get_file_data_path;
+use crate::config::{get_file_data_path, get_file_metadata_path};
 
 #[get("/v1/file/{hash}/metadata")]
 async fn get_file_metadata(web::Path(hash): web::Path<String>) -> Result<String, ()> {
@@ -18,8 +18,15 @@ async fn get_file_metadata(web::Path(hash): web::Path<String>) -> Result<String,
 #[post("/v1/file/{hash}/content")]
 async fn post_file_content(web::Path(hash): web::Path<String>, mut payload: Multipart) -> String {
     let data_file_path = get_file_data_path(&hash);
+    let metadata_file_path = get_file_metadata_path(&hash);
 
     log::info!("Saving file contents to {}", data_file_path);
+
+    let meta = FileMetadata::get_or_create(&metadata_file_path);
+
+    if (meta.received_at.is_none()) {
+        met
+    }
     
     while let Ok(Some(mut field)) = payload.try_next().await {
         let mime = field.content_type().clone();
@@ -28,37 +35,53 @@ async fn post_file_content(web::Path(hash): web::Path<String>, mut payload: Mult
         let mime_str = mime_string.as_str();
 
         match mime_str {
-            "application/octet-stream" => {
-                let mut file = provide_file_handle(&data_file_path);
-
+            "text/plain" => {
                 let content_type = field.content_disposition().unwrap();
-    
-                let filename = content_type.get_filename().unwrap();
-                let filepath = format!("./tmp/{}", sanitize_filename::sanitize(&filename));
-        
 
+                let name = content_type.get_name().unwrap();
 
-                // File::create is blocking operation, use threadpool
-                let mut f = web::block(|| std::fs::File::create(filepath))
-                    .await
-                    .unwrap();
-        
-                // Field in turn is stream of *Bytes* object
+                println!("name {}", name);
+
                 while let Some(chunk) = field.next().await {
                     let data = chunk.unwrap();
-                    println!("data bytes {}", data.len());
-        
-                    // file.write_all(&data).unwrap();
-                    //filesystem operations are blocking, we have to use threadpool
-                    f = web::block(move || f.write_all(&data).map(|_| f)).await.unwrap();
+                    let bytes = data.to_vec();
+
+                    let text = String::from_utf8_lossy(&bytes);
+
+                    println!("text {}", text);
                 }  
+            }
+            "application/octet-stream" => {
+                // let mut file = provide_file_handle(&data_file_path);
+
+                // let content_type = field.content_disposition().unwrap();
+    
+                // let filename = content_type.get_filename().unwrap();
+                // let filepath = format!("../tmp/{}", sanitize_filename::sanitize(&filename));
+        
+
+
+                // // File::create is blocking operation, use threadpool
+                // // let mut f = web::block(|| std::fs::File::create(filepath))
+                // //     .await
+                // //     .unwrap();
+        
+                // // Field in turn is stream of *Bytes* object
+                // while let Some(chunk) = field.next().await {
+                //     let data = chunk.unwrap();
+                //     println!("data bytes {}", data.len());
+
+                //     // file.write_all(&data).unwrap();
+        
+                //     // file.write_all(&data).unwrap();
+                //     //filesystem operations are blocking, we have to use threadpool
+                //     file = web::block(move || file.write_all(&data).map(|_| file)).await.unwrap();
+                // }  
             },
             _ => {
                 panic!("Unsupported mime type");
             }
         }
-
-        println!("mime {}", mime);
     }
 
 

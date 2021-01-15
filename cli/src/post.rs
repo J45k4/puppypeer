@@ -1,6 +1,7 @@
 use std::{fmt::format, io::BufReader, path::Path};
 
 use clap::ArgMatches;
+use common::get_millis_timestamp;
 use futures::Stream;
 use reqwest::{Body, Client, multipart::{Form, Part}};
 use tokio::prelude::*;
@@ -43,9 +44,23 @@ pub async fn exec_post(args: &ArgMatches<'_>) {
             .unwrap().to_str().unwrap().to_string();
 
         let s = Part::stream(body).file_name(file_name);
+
+        let modified = get_millis_timestamp(metadata.modified().unwrap()).unwrap();
+        let accessed = get_millis_timestamp(metadata.accessed().unwrap()).unwrap();
+        let created = get_millis_timestamp(metadata.created().unwrap()).unwrap();
+        let readonly = metadata.permissions().readonly();
+
+        let relative_path = file_path.strip_prefix(input_folder_path_str).unwrap().to_str().unwrap().to_string();
     
         let form = Form::new()
-            .part("file", s);
+            .part("file", s)
+            .part("modified_at", Part::text(modified.to_string()).mime_str("text/plain").unwrap())
+            .part("accessed_at", Part::text(accessed.to_string()).mime_str("text/plain").unwrap())
+            .part("created_at", Part::text(created.to_string()).mime_str("text/plain").unwrap())
+            .part("readonly", Part::text(readonly.to_string()).mime_str("text/plain").unwrap())
+            .part("full_file_path", Part::text(file_path_str.clone()).mime_str("text/plain").unwrap())
+            .part("relative_file_path", Part::text(relative_path).mime_str("text/plain").unwrap())
+            .part("root_folder_path", Part::text(input_folder_path_str.to_string()).mime_str("text/plain").unwrap());
 
         let client = Client::new();
 
@@ -59,11 +74,4 @@ pub async fn exec_post(args: &ArgMatches<'_>) {
             .multipart(form)
             .send().await.unwrap();
     }
-
-
-    // Body::wrap_stream(stream)
-
-    // let form = reqwest::multipart::Form::new();
-
-    // form.part(name, part)
 }
