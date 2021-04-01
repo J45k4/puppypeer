@@ -24,9 +24,9 @@ async fn post_file_content(web::Path(hash): web::Path<String>, mut payload: Mult
 
     let meta = FileMetadata::get_or_create(&metadata_file_path);
 
-    if (meta.received_at.is_none()) {
-        met
-    }
+    // if (meta.received_at.is_none()) {
+    //     met
+    // }
     
     while let Ok(Some(mut field)) = payload.try_next().await {
         let mime = field.content_type().clone();
