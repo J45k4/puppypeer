@@ -65,6 +65,7 @@ pub async fn exec_post(args: &ArgMatches<'_>) {
         let client = Client::new();
 
         let hash = common::calc_file_hash(&file_path_str).unwrap();
+        let hash = common::convert_hash_to_string(&hash);
 
         let url = format!("{}/v1/file/{}/content", base_url, hash);
 

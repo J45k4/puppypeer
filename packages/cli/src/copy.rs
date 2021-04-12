@@ -52,6 +52,7 @@ pub fn exec_copy(args: &ArgMatches) {
         let file_path_str = file_path.display().to_string();
 
         let hash = common::calc_file_hash(&file_path_str).unwrap();
+        let hash = common::convert_hash_to_string(&hash);
 
         let metadata_file_path = output_folder_path.join(format!("epic-shelter-metadata-{}.json", hash));
     
