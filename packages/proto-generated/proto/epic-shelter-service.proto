@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+package EpicShelter;
+
+message FsChange {
+    string file_path = 1;
+    string file_hash = 2;
+    uint64 file_size = 3;
+    uint64 credted_at = 4;
+    uint64 modified_at = 5;
+    uint64 accessed_at = 6;
+    bool readonly = 7;
+}
+
+message PushFsChangesRequest {
+    repeated FsChange changes = 1;
+}
+
+message PushFsChangesResponse {
+
+}
+
+message SubscribeToCommandsRequest {
+
+}
+
+message ScanFolder {
+    string path = 1;
+    bool recursive = 2;
+    bool watch = 3;
+}
+
+message MoveFiles {
+    string src_path = 1;
+    bool recursive = 2;
+    string dst_path = 3;
+}
+
+message UploadFile {
+    string file_hash = 1;
+}
+
+message Command {
+    oneof command_type {
+        ScanFolder scan_folder = 1;
+        MoveFiles move_files = 2;
+        UploadFile upload_file = 3;
+        bool remove_me = 4;
+    }
+}
+
+message SendClientInfoRequest {
+    string version = 1;
+}
+
+message SendClientInfoResponse {
+
+}
+
+message FetchFileMetadataRequest {
+    string file_hash = 1;
+}
+
+message FetchFileMetadataResponse {
+    string file_hash = 1;
+    uint64 file_size = 2;
+    uint64 credted_at = 3;
+    uint64 modified_at = 4;
+    uint64 accessed_at = 5;
+}
+
+service EpicShelter {
+    rpc push_fs_changes(PushFsChangesRequest) returns (PushFsChangesResponse) {}
+    rpc subscribe_to_commands(SubscribeToCommandsRequest) returns (stream Command) {}
+    rpc send_client_info(SendClientInfoRequest) returns (SendClientInfoResponse) {}
+    rpc fetch_file_metadata(FetchFileMetadataRequest) returns (FetchFileMetadataResponse) {}
+}
