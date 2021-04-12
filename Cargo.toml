@@ -3,5 +3,6 @@ members =  [
     "packages/cli",
     "packages/server",
     "packages/common",
-    "packages/agent"
+    "packages/agent",
+    "packages/proto-generated"
 ]
