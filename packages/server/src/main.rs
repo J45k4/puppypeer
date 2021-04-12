@@ -1,92 +1,150 @@
-use std::io::Write;
 
-use actix_multipart::Multipart;
-use actix_web::{App, Error, HttpRequest, HttpResponse, HttpServer, middleware, web};
-use futures::{StreamExt, TryStreamExt};
+use std::convert::Infallible;
+use std::pin::Pin;
+use std::time::Duration;
 
-use actix_web::{post, get};
-use simple_logger::SimpleLogger;
+use either_body::*;
+use epic_shelter_generated_protos::epic_shelter::Command;
+use epic_shelter_generated_protos::epic_shelter::PushFsChangesResponse;
+use epic_shelter_generated_protos::epic_shelter::SendClientInfoResponse;
+use epic_shelter_generated_protos::epic_shelter::SubscribeToCommandsRequest;
+use futures::Stream;
+use futures::future::Either;
+use log::LevelFilter;
+use tokio::sync::mpsc;
+use tokio::time::sleep;
+use tonic::Response;
+use tonic::Status;
+use tonic::client::GrpcService;
+use warp::Filter;
+use warp::hyper::Server;
+use tonic::transport::Server as TonicServer;
+use epic_shelter_generated_protos::epic_shelter::epic_shelter_server::EpicShelterServer;
+use epic_shelter_generated_protos::epic_shelter::epic_shelter_server::EpicShelter;
+use warp::hyper::Version;
+use warp::hyper::service::make_service_fn;
+use futures::future;
+use futures::future::TryFutureExt;
 
-mod handlers;
-mod config;
+mod either_body;
 
-async fn save_file(mut payload: Multipart) -> Result<HttpResponse, Error> {
-    // iterate over multipart stream
-    while let Ok(Some(mut field)) = payload.try_next().await {
-        let mime = field.content_type();
+pub struct EpicShelterImpl {
+    db: sled::Db
+}
 
-        println!("mime {}", mime.type_());
-
-        let content_type = field.content_disposition().unwrap();
-
-        let filename = content_type.get_filename().unwrap();
-        let filepath = format!("./tmp/{}", sanitize_filename::sanitize(&filename));
-
-        // File::create is blocking operation, use threadpool
-        let mut f = web::block(|| std::fs::File::create(filepath))
-            .await
-            .unwrap();
-
-        // Field in turn is stream of *Bytes* object
-        while let Some(chunk) = field.next().await {
-            let data = chunk.unwrap();
-            println!("data bytes {}", data.len());
-
-            // filesystem operations are blocking, we have to use threadpool
-            f = web::block(move || f.write_all(&data).map(|_| f)).await?;
+impl EpicShelterImpl {
+    fn new(db: sled::Db) -> EpicShelterImpl {
+        EpicShelterImpl{
+            db: db,
         }
     }
-    
-    println!("save_file ready");
-
-    Ok(HttpResponse::Ok().into())
 }
 
-fn ping() -> HttpResponse {
-    HttpResponse::Ok().body("ok")
+#[async_trait::async_trait]
+impl EpicShelter for EpicShelterImpl {
+    async fn push_fs_changes(
+            &self,
+            request: tonic::Request<epic_shelter_generated_protos::epic_shelter::PushFsChangesRequest>,
+        ) -> Result<tonic::Response<epic_shelter_generated_protos::epic_shelter::PushFsChangesResponse>, tonic::Status> {
+        
+            println!("Handling this shit {:?}", request);
+
+        Ok(tonic::Response::new(PushFsChangesResponse{}))
+    }
+
+    type subscribe_to_commandsStream = Pin<Box<dyn Stream<Item = Result<Command, Status>> + Send + Sync + 'static>>;
+
+    async fn subscribe_to_commands(
+        &self,
+        request: tonic::Request<SubscribeToCommandsRequest>,
+    ) -> Result<tonic::Response<Self::subscribe_to_commandsStream>, tonic::Status> {
+        let (tx, rx) = mpsc::channel(4);
+
+        tokio::spawn(async move {
+            let tx = tx;
+            loop {
+                match tx.send(Ok(Command{ 
+                    ..Default::default()
+                })).await {
+                    Ok(_) => {},
+                    Err(_) => return
+                }
+
+                sleep(Duration::from_secs(1)).await;
+            }
+        });
+
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
+    }
+
+    async fn send_client_info(
+            &self,
+            request: tonic::Request<epic_shelter_generated_protos::epic_shelter::SendClientInfoRequest>,
+        ) -> Result<Response<epic_shelter_generated_protos::epic_shelter::SendClientInfoResponse>, Status> {
+        //self.db.insert(key, value)
+
+        println!("Client version {}", request.get_ref().version);
+
+        Ok(tonic::Response::new(SendClientInfoResponse{}))
+    }
+
+    async fn fetch_file_metadata(
+            &self,
+            request: tonic::Request<epic_shelter_generated_protos::epic_shelter::FetchFileMetadataRequest>,
+        ) -> Result<Response<epic_shelter_generated_protos::epic_shelter::FetchFileMetadataResponse>, Status> {
+        todo!()
+    }
 }
 
-fn index() -> HttpResponse {
-    let html = r#"<html>
-        <head><title>Upload Test</title></head>
-        <body>
-            <form target="/" method="post" enctype="multipart/form-data">
-                <input type="file" multiple name="file"/>
-                <button type="submit">Submit</button>
-            </form>
-        </body>
-    </html>"#;
+#[tokio::main]
+async fn main() {
+    env_logger::Builder::new()
+        .filter_level(LevelFilter::Info)
+        .format_timestamp(None)
+        .init();
 
-    HttpResponse::Ok().body(html)
+    let db = sled::open("./serverdb").unwrap();
+
+    let addr = "[::1]:45000".parse().unwrap();
+
+    let epic_shelter = EpicShelterServer::new(EpicShelterImpl::new(db.clone()));
+    let mut warp = warp::service(warp::path("hello").map(|| "hello, world!"));
+
+    Server::bind(&addr)
+        .serve(make_service_fn(move |_| {
+            let mut epic_shelter = epic_shelter.clone();
+
+            future::ok::<_, Infallible>(tower::service_fn(
+                move |req: hyper::Request<hyper::Body>| match req.version() {
+                    Version::HTTP_11 | Version::HTTP_10 => Either::Left(
+                        warp.call(req)
+                            .map_ok(|res| res.map(EitherBody::Left))
+                            .map_err(Error::from),
+                    ),
+                    Version::HTTP_2 => Either::Right(          
+                        epic_shelter.call(req)
+                            .map_ok(|res| res.map(EitherBody::Right))
+                            .map_err(Error::from),
+                    ),
+                    _ => unimplemented!()
+                }
+            ))
+        })).await.unwrap();
 }
 
-
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    SimpleLogger::new()
-        .with_level(log::LevelFilter::Info)
-        .init()
-        .unwrap();
-
-    std::env::set_var("RUST_LOG", "actix_server=info,actix_web=info");
-    std::fs::create_dir_all("./tmp").unwrap();
-
-    let ip = "0.0.0.0:45000";
-
-    HttpServer::new(|| {
-        App::new().wrap(middleware::Logger::default()).service(
-            web::resource("/")
-                .route(web::get().to(index))
-                .route(web::post().to(save_file)),
-        ).service(
-            web::resource("/ping")
-                .route(web::get().to(ping)),
-        ).service(
-            web::resource("/v1/file/")
-        ).service(handlers::get_file_metadata)
-        .service(handlers::post_file_content)
-    })
-    .bind(ip)?
-    .run()
-    .await
-}
+// match req.version() {
+//     Version::HTTP_11 | Version::HTTP_10 => Either::Left(
+//         warp.call(req)
+//             .map_ok(|res| res.map(EitherBody::Left))
+//             .map_err(Error::from),
+//     ),
+//     Version::HTTP_2 => Either::Right(
+//         tonic
+//             .call(req)
+//             .map_ok(|res| res.map(EitherBody::Right))
+//             .map_err(Error::from),
+//     ),
+//     _ => unimplemented!(),
+// }
