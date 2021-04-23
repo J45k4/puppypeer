@@ -23,7 +23,10 @@ pub struct PushFsChangesRequest {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PushFsChangesResponse {}
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SubscribeToCommandsRequest {}
+pub struct SubscribeToCommandsRequest {
+    #[prost(string, tag = "1")]
+    pub agent_id: ::prost::alloc::string::String,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ScanFolder {
     #[prost(string, tag = "1")]
@@ -49,7 +52,7 @@ pub struct UploadFile {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Command {
-    #[prost(oneof = "command::CommandType", tags = "1, 2, 3, 4")]
+    #[prost(oneof = "command::CommandType", tags = "1, 2, 3, 4, 5")]
     pub command_type: ::core::option::Option<command::CommandType>,
 }
 /// Nested message and enum types in `Command`.
@@ -64,6 +67,8 @@ pub mod command {
         UploadFile(super::UploadFile),
         #[prost(bool, tag = "4")]
         RemoveMe(bool),
+        #[prost(bool, tag = "5")]
+        Ping(bool),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]

@@ -121,7 +121,9 @@ impl ServerClient {
     async fn create_sub(&self) -> Result<Streaming<Command>, failure::Error> {
         let mut client = self.get_client().await?;
 
-        Ok(client.subscribe_to_commands(SubscribeToCommandsRequest{}).await?.into_inner())
+        Ok(client.subscribe_to_commands(SubscribeToCommandsRequest{
+			agent_id: "123".to_string()
+		}).await?.into_inner())
     }
 }
 

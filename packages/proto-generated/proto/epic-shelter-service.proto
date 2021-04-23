@@ -21,7 +21,7 @@ message PushFsChangesResponse {
 }
 
 message SubscribeToCommandsRequest {
-
+	string agent_id = 1;
 }
 
 message ScanFolder {
@@ -46,6 +46,7 @@ message Command {
         MoveFiles move_files = 2;
         UploadFile upload_file = 3;
         bool remove_me = 4;
+		bool ping = 5;
     }
 }
 

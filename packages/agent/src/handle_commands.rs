@@ -19,6 +19,9 @@ pub async fn handle_commands(client: ServerClient) {
                         CommandType::RemoveMe(_) => {
                             return;
                         }
+						CommandType::Ping(_) => {
+
+						}
                     }
                 }
             }
