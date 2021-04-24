@@ -8,7 +8,7 @@ pub enum MessageFromClient {
     SubscribeToAgents
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct AgentState {
 	pub agent_id: String,
     pub computer_name: String,
