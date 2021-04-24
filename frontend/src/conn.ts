@@ -30,6 +30,10 @@ export const unsubscribeFromServerMessages = (subscriber: ServerMessageSubscribe
 const token = "qwert"
 
 function createClient() {
+	if (socket) {
+		return
+	}
+
     // var scheme = document.location.protocol == "https:" ? "wss" : "ws";
     // var port = document.location.port ? ":" + document.location.port : "";
     // var wsURL = scheme + "://" + document.location.hostname + port + "/api/socket?token=" + token
@@ -44,11 +48,13 @@ function createClient() {
         })
     }
 
-    // socket.onerror = (e) => {
-	// 	e.
-    // }
+    socket.onerror = (e) => {
+		socket = undefined
+    }
 
     socket.onclose = () => {
+		socket = undefined
+
         connEvents.next({
 			type: "websocketDisconnected"
         })
