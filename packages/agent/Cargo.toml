@@ -19,3 +19,8 @@ tonic = "0.4"
 failure = "0.1"
 serde = "1.0"
 bincode = "1.3"
+quinn = "0.7.2"
+url = "2"
+anyhow = "1"
+rustls = { version = "0.19", features = ["quic", "dangerous_configuration"] }
+webpki = { version = "0.21" }

@@ -43,6 +43,12 @@ impl AgentRegister {
 		}
 	}
 
+	pub async fn get_agents(&self) -> Vec<Agent> {
+		let agents = self.agents.read().await;
+
+		agents.values().map(|a| a.clone()).collect()
+	}
+
 	pub async fn emit_agent_change(&self, agent: Agent) {
 		let mut agents = self.agents.write().await;
 

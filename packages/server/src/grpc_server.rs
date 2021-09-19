@@ -2,8 +2,10 @@ use std::pin::Pin;
 use epic_shelter_generated_protos::epic_shelter::Command;
 use epic_shelter_generated_protos::epic_shelter::PushFsChangesResponse;
 use epic_shelter_generated_protos::epic_shelter::SendClientInfoResponse;
+use epic_shelter_generated_protos::epic_shelter::ServerEvent;
 use epic_shelter_generated_protos::epic_shelter::SubscribeToCommandsRequest;
 use epic_shelter_generated_protos::epic_shelter::epic_shelter_server::EpicShelter;
+use epic_shelter_generated_protos::epic_shelter::ClientEvent;
 use futures::Stream;
 use tokio::sync::mpsc;
 use tonic::Response;
@@ -45,6 +47,8 @@ impl EpicShelter for EpicShelterImpl {
         &self,
         request: tonic::Request<SubscribeToCommandsRequest>,
     ) -> Result<tonic::Response<Self::subscribe_to_commandsStream>, tonic::Status> {
+		log::info!("Subscribed to commands");
+
 		let register = self.agent_register.clone();
 
 		let request = request.into_inner();
@@ -109,4 +113,17 @@ impl EpicShelter for EpicShelterImpl {
         ) -> Result<Response<epic_shelter_generated_protos::epic_shelter::FetchFileMetadataResponse>, Status> {
         todo!()
     }
+
+	type eventsStream = Pin<Box<dyn Stream<Item = Result<ServerEvent, Status>> + Send + Sync + 'static>>;
+
+	async fn events(
+		&self,
+		request: tonic::Request<tonic::Streaming<ClientEvent>>
+	) -> Result<Response<Self::eventsStream>, Status> {
+		let (tx, rx) = mpsc::channel(20);
+
+		let s = ReceiverStream::new(rx);
+
+		Ok(Response::new(Box::pin(s) as Self::eventsStream))
+	}
 }

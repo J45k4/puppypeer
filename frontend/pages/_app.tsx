@@ -1,6 +1,7 @@
 import { subToConnEvents } from '../src/conn'
 import { subscribeToAgents } from '../src/use-agents-state'
 import '../styles/globals.css'
+import 'bootstrap/dist/css/bootstrap.min.css';
 
 if (typeof window !== "undefined") {
 	subToConnEvents({

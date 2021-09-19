@@ -96,6 +96,10 @@ pub struct FetchFileMetadataResponse {
     #[prost(uint64, tag = "5")]
     pub accessed_at: u64,
 }
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ServerEvent {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ClientEvent {}
 #[doc = r" Generated client implementations."]
 pub mod epic_shelter_client {
     #![allow(unused_variables, dead_code, missing_docs)]
@@ -128,6 +132,23 @@ pub mod epic_shelter_client {
         pub fn with_interceptor(inner: T, interceptor: impl Into<tonic::Interceptor>) -> Self {
             let inner = tonic::client::Grpc::with_interceptor(inner, interceptor);
             Self { inner }
+        }
+        pub async fn events(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<Message = super::ClientEvent>,
+        ) -> Result<tonic::Response<tonic::codec::Streaming<super::ServerEvent>>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::new(
+                    tonic::Code::Unknown,
+                    format!("Service was not ready: {}", e.into()),
+                )
+            })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/EpicShelter.EpicShelter/events");
+            self.inner
+                .streaming(request.into_streaming_request(), path, codec)
+                .await
         }
         pub async fn push_fs_changes(
             &mut self,
@@ -215,6 +236,15 @@ pub mod epic_shelter_server {
     #[doc = "Generated trait containing gRPC methods that should be implemented for use with EpicShelterServer."]
     #[async_trait]
     pub trait EpicShelter: Send + Sync + 'static {
+        #[doc = "Server streaming response type for the events method."]
+        type eventsStream: Stream<Item = Result<super::ServerEvent, tonic::Status>>
+            + Send
+            + Sync
+            + 'static;
+        async fn events(
+            &self,
+            request: tonic::Request<tonic::Streaming<super::ClientEvent>>,
+        ) -> Result<tonic::Response<Self::eventsStream>, tonic::Status>;
         async fn push_fs_changes(
             &self,
             request: tonic::Request<super::PushFsChangesRequest>,
@@ -269,6 +299,39 @@ pub mod epic_shelter_server {
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
             let inner = self.inner.clone();
             match req.uri().path() {
+                "/EpicShelter.EpicShelter/events" => {
+                    #[allow(non_camel_case_types)]
+                    struct eventsSvc<T: EpicShelter>(pub Arc<T>);
+                    impl<T: EpicShelter> tonic::server::StreamingService<super::ClientEvent> for eventsSvc<T> {
+                        type Response = super::ServerEvent;
+                        type ResponseStream = T::eventsStream;
+                        type Future =
+                            BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<tonic::Streaming<super::ClientEvent>>,
+                        ) -> Self::Future {
+                            let inner = self.0.clone();
+                            let fut = async move { (*inner).events(request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let interceptor = inner.1;
+                        let inner = inner.0;
+                        let method = eventsSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = if let Some(interceptor) = interceptor {
+                            tonic::server::Grpc::with_interceptor(codec, interceptor)
+                        } else {
+                            tonic::server::Grpc::new(codec)
+                        };
+                        let res = grpc.streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/EpicShelter.EpicShelter/push_fs_changes" => {
                     #[allow(non_camel_case_types)]
                     struct push_fs_changesSvc<T: EpicShelter>(pub Arc<T>);

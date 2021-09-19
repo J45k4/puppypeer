@@ -1,5 +1,5 @@
 import React from "react"
-import { Navbar } from "react-bootstrap"
+import { Nav, Navbar } from "react-bootstrap"
 import Link from "next/link"
 
 export const Navigationbar = () => {
@@ -19,6 +19,16 @@ export const Navigationbar = () => {
 						cursor: "pointer"
 					}}>Epic shelter</Navbar.Brand>
 				</Link>
+				<Navbar.Toggle aria-controls="responsive-navbar-nav" />
+				<Navbar.Collapse>
+					<Nav className="mr-auto">
+						<Link href="/agents" passHref>
+							<Nav.Link>
+								Agents
+							</Nav.Link>
+						</Link>
+					</Nav>
+				</Navbar.Collapse>
 		</Navbar>
 	)
 }

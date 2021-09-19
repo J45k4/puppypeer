@@ -1,17 +1,11 @@
 
-import { sendMessageToServer } from '../src/conn'
-import styles from '../styles/Home.module.css'
+import { Fragment } from 'react'
+import { Navigationbar } from '../src/navigationbar'
 
 export default function Home() {
   return (
-    <div className={styles.container}>
-      <button onClick={() => {
-        sendMessageToServer({
-          
-        })
-      }}>
-        Do something
-      </button>
-    </div>
+    <Fragment>
+		<Navigationbar />
+	</Fragment>
   )
 }

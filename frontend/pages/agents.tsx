@@ -1,9 +1,17 @@
-import React from "react"
+import React, { Fragment } from "react"
+import { Container } from "react-bootstrap"
 import { AgentsTable } from "../src/agents-table"
+import { Navigationbar } from "../src/navigationbar"
 
 const Agents = () => {
     return (
-        <AgentsTable />
+		<Fragment>
+			<Navigationbar />
+			<Container>
+				<AgentsTable />
+			</Container>
+		</Fragment>
+        
     )
 }
 

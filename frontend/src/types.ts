@@ -9,6 +9,15 @@ export interface AgentState {
     sendSpeed: number
 }
 
+export interface FolderEntry {
+	type: "folderEntry"
+	entryType: "FILE" | "FOLDER"
+	name: string
+	path: string
+	modifiedAt: Date
+	createdAt: Date
+}
+
 export interface subscribeToAgents {
     type: "subscribeToAgents"
 }
@@ -31,5 +40,6 @@ export interface WebsocketDisconnected {
 // }
 
 export type ConnectionEvent = AgentState |
+	FolderEntry |
     WebsocketConnected |
     WebsocketDisconnected

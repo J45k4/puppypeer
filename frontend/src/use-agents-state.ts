@@ -1,20 +1,17 @@
 import { useEffect, useState } from "react"
 import { sendMessageToServer, subToConnEvents } from "./conn"
-import { AgentState, MessageToServer } from "./types"
+import { AgentState } from "./types"
 
+const agentsMap = new Map<string, AgentState>()
 
 export const useAgents = () => {
-    const [agents, setAgents] = useState<AgentState[]>([])
+    const [agents, setAgents] = useState<AgentState[]>(Array.from(agentsMap.values()))
 
     useEffect(() => {
-        const agentsMap = new Map<string, AgentState>()
 
         const s = subToConnEvents({
             next: (msg) => {
                 if (msg.type === "agentState") {
-					console.log("storing this agent state")
-                    agentsMap.set(msg.agent_id, msg)
-					console.log("agentsMap", agentsMap)
                     setAgents(Array.from(agentsMap.values()))
                 }
             }
@@ -27,6 +24,15 @@ export const useAgents = () => {
 
     return agents
 }
+
+subToConnEvents({
+	next: (e) => {
+		if (e.type === "agentState") {
+			agentsMap.set(e.agent_id, e)
+		}
+	},
+	error: () => {}
+})
 
 export const subscribeToAgents = () => {
     sendMessageToServer({
