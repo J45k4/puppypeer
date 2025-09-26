@@ -1,0 +1,28 @@
+[package]
+name = "puppyagent_core"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["sha2"]
+ring = ["dep:ring"]
+rayon = ["dep:rayon"]
+sha2 = ["dep:sha2"]
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+infer = "0.19"
+libp2p = { version = "0.56", features = ["tokio", "tcp", "identify", "noise", "yamux", "ping", "macros", "request-response", "json"] }
+log = "0.4"
+mime_guess = "2"
+rayon = { version = "1", optional = true }
+ring = { version = "0.17", optional = true }
+rusqlite = { version = "0.33", features = ["bundled", "chrono"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = { version = "0.10", features = ["oid"], optional = true }
+sysinfo = "0.35"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+walkdir = "2"

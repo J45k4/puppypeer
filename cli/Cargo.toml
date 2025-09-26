@@ -1,0 +1,57 @@
+[package]
+name = "puppyagent"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+log = "0.4"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+simple_logger = "5"
+ratatui = "0.27"
+crossterm = "0.27"
+puppyagent_core = { path = "../core" }
+# Optional dependencies gated by features
+sha2 = { version = "0.10", features = ["oid"], optional = true }
+rsa = { version = "0.9", default-features = false, features = ["sha2", "pem"], optional = true }
+ring = { version = "0.17", optional = true }
+flate2 = { version = "1", optional = true }
+tar = { version = "0.4", optional = true }
+reqwest = { version = "0.12", features = ["json", "gzip", "rustls-tls"], optional = true }
+homedir = { version = "0.3", optional = true }
+serde_json = { version = "1", optional = true }
+service-manager = { version = "0.8", optional = true }
+rusqlite = { version = "0.33", features = ["bundled", "chrono"], optional = true }
+libp2p = { version = "0.56", features = ["tokio", "tcp", "identify", "noise", "yamux", "ping", "macros", "request-response", "json"], optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+rayon = { version = "1", optional = true }
+
+[features]
+default = [
+	"sha2",
+	"rsa",
+	"reqwest",
+	"flate2",
+	"tar",
+	"homedir",
+	"serde_json",
+	"service-manager",
+	"rusqlite",
+	"libp2p",
+	"uuid",
+	"puppyagent_core/sha2"
+]
+sha2 = ["dep:sha2"]
+rsa = ["dep:rsa", "sha2"]
+reqwest = ["dep:reqwest", "serde_json"]
+flate2 = ["dep:flate2"]
+tar = ["dep:tar"]
+homedir = ["dep:homedir"]
+serde_json = ["dep:serde_json"]
+service-manager = ["dep:service-manager"]
+rusqlite = ["dep:rusqlite"]
+libp2p = ["dep:libp2p"]
+uuid = ["dep:uuid"]
+ring = ["dep:ring", "puppyagent_core/ring"]
+rayon = ["dep:rayon", "puppyagent_core/rayon"]

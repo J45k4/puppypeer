@@ -1,4 +1,3 @@
 {
     "debug.allowBreakpointsEverywhere": true,
-    "rust-analyzer.assist.importMergeBehavior": "none"
 }

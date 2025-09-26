@@ -1,8 +1,8 @@
 [workspace]
-members =  [
-    "packages/cli",
-    "packages/server",
-    "packages/common",
-    "packages/agent",
-    "packages/proto-generated"
-]
+resolver = "3"
+members = ["cli", "core"]
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "z"
