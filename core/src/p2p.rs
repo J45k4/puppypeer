@@ -3,7 +3,7 @@ use futures::prelude::*;
 use libp2p::core::ConnectedPoint;
 use libp2p::identity::Keypair;
 use libp2p::multiaddr::Protocol;
-use libp2p::ping;
+use libp2p::{mdns, ping};
 use libp2p::request_response::{
 	self, Config as RequestResponseConfig, Event as RequestResponseEvent,
 	Message as RequestResponseMessage, ProtocolSupport,
@@ -38,7 +38,7 @@ const VIEWER_ROLE: &str = "viewer";
 const DEFAULT_SESSION_TTL: u64 = 60 * 60; // 1 hour sessions for credential auth
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-enum FileMetaRequest {
+pub enum FileMetaRequest {
 	ListDir {
 		path: String,
 	},
@@ -61,7 +61,7 @@ enum FileMetaRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-enum FileMetaResponse {
+pub enum FileMetaResponse {
 	DirEntries(Vec<FileEntry>),
 	FileStat(FileEntry),
 	FileChunk(FileChunk),
@@ -251,17 +251,19 @@ type ControlBehaviour =
 
 #[derive(NetworkBehaviour)]
 #[behaviour(to_swarm = "AgentEvent", event_process = false)]
-struct AgentBehaviour {
+pub struct AgentBehaviour {
 	ping: ping::Behaviour,
 	file_meta: FileMetaBehaviour,
 	control_plane: ControlBehaviour,
+	mdns: mdns::tokio::Behaviour
 }
 
 #[derive(Debug)]
-enum AgentEvent {
+pub enum AgentEvent {
 	Ping(ping::Event),
 	FileMeta(RequestResponseEvent<FileMetaRequest, FileMetaResponse>),
 	Control(RequestResponseEvent<ControlPlaneRequest, ControlPlaneResponse>),
+	Mdns(mdns::Event)
 }
 
 impl From<ping::Event> for AgentEvent {
@@ -282,28 +284,37 @@ impl From<RequestResponseEvent<ControlPlaneRequest, ControlPlaneResponse>> for A
 	}
 }
 
+impl From<mdns::Event> for AgentEvent {
+    fn from(event: mdns::Event) -> Self {
+        AgentEvent::Mdns(event)
+    }
+}
+
 impl AgentBehaviour {
-	fn new() -> Self {
-		let file_protocols = std::iter::once((
-			StreamProtocol::new(FILE_META_PROTOCOL),
-			ProtocolSupport::Full,
-		));
-		let control_protocols =
-			std::iter::once((StreamProtocol::new(CONTROL_PROTOCOL), ProtocolSupport::Full));
-		let file_meta = request_response::json::Behaviour::new(
-			file_protocols,
-			RequestResponseConfig::default(),
-		);
-		let control_plane = request_response::json::Behaviour::new(
-			control_protocols,
-			RequestResponseConfig::default(),
-		);
-		Self {
-			ping: ping::Behaviour::default(),
-			file_meta,
-			control_plane,
-		}
-	}
+    fn new(local_peer_id: PeerId) -> Self {
+        let file_protocols = std::iter::once((
+            StreamProtocol::new(FILE_META_PROTOCOL),
+            ProtocolSupport::Full,
+        ));
+        let control_protocols =
+            std::iter::once((StreamProtocol::new(CONTROL_PROTOCOL), ProtocolSupport::Full));
+        let file_meta = request_response::json::Behaviour::new(
+            file_protocols,
+            RequestResponseConfig::default(),
+        );
+        let control_plane = request_response::json::Behaviour::new(
+            control_protocols,
+            RequestResponseConfig::default(),
+        );
+        let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)
+            .expect("mDNS init failed");
+        Self {
+            ping: ping::Behaviour::default(),
+            file_meta,
+            control_plane,
+            mdns,
+        }
+    }
 }
 
 fn handle_file_request(req: FileMetaRequest) -> FileMetaResponse {
@@ -1201,7 +1212,7 @@ fn path_matches(grant: &str, request: &str) -> bool {
 }
 
 /// Load or generate an Ed25519 keypair and persist it to disk.
-fn load_or_generate_keypair(path: &Path) -> Result<identity::Keypair> {
+pub fn load_or_generate_keypair(path: &Path) -> Result<identity::Keypair> {
 	if path.exists() {
 		let bytes = fs::read(path)?;
 		let key = Keypair::from_protobuf_encoding(&bytes)?;
@@ -1233,7 +1244,7 @@ fn libp2p_multiaddr(address: &Multiaddr, local_ip: IpAddr, peer_id: &PeerId) -> 
 	reachable
 }
 
-pub fn build_swarm(id_keys: identity::Keypair) -> Result<Swarm<AgentBehaviour>> {
+pub fn build_swarm(id_keys: identity::Keypair, peer_id: PeerId) -> Result<Swarm<AgentBehaviour>> {
 	let swarm = SwarmBuilder::with_existing_identity(id_keys)
 		.with_tokio()
 		.with_tcp(
@@ -1241,237 +1252,237 @@ pub fn build_swarm(id_keys: identity::Keypair) -> Result<Swarm<AgentBehaviour>> 
 			noise::Config::new,
 			yamux::Config::default,
 		)?
-		.with_behaviour(|_| AgentBehaviour::new())?
+		.with_behaviour(|_| AgentBehaviour::new(peer_id))?
 		.with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(u64::MAX)))
 		.build();
 	Ok(swarm)
 }
 
-pub async fn start(binds: Vec<String>, peers: Vec<String>, _wg: WaitGroupGuard) -> Result<()> {
-	let key_path = env::var("KEYPAIR").unwrap_or_else(|_| String::from("peer_keypair.bin"));
-	let key_path = Path::new(&key_path);
-	let id_keys = load_or_generate_keypair(key_path)?;
-	let peer_id = PeerId::from(id_keys.public());
+// pub async fn start(binds: Vec<String>, peers: Vec<String>, _wg: WaitGroupGuard) -> Result<()> {
+// 	let key_path = env::var("KEYPAIR").unwrap_or_else(|_| String::from("peer_keypair.bin"));
+// 	let key_path = Path::new(&key_path);
+// 	let id_keys = load_or_generate_keypair(key_path)?;
+// 	let peer_id = PeerId::from(id_keys.public());
 
-	log::info!("Local peer id {}", peer_id);
+// 	log::info!("Local peer id {}", peer_id);
 
-	// Determine local IPv4 address for LAN connectivity
-	let local_ip = {
-		let sock = UdpSocket::bind("0.0.0.0:0")?;
-		// Use an external address to pick the outbound interface
-		sock.connect("8.8.8.8:80")?;
-		sock.local_addr()?.ip()
-	};
-	log::info!("Local network IP address: {}", local_ip);
+// 	// Determine local IPv4 address for LAN connectivity
+// 	let local_ip = {
+// 		let sock = UdpSocket::bind("0.0.0.0:0")?;
+// 		// Use an external address to pick the outbound interface
+// 		sock.connect("8.8.8.8:80")?;
+// 		sock.local_addr()?.ip()
+// 	};
+// 	log::info!("Local network IP address: {}", local_ip);
 
-	let mut swarm = build_swarm(id_keys)?;
-	let auth_manager = Arc::new(Mutex::new(AuthManager::default()));
+// 	let mut swarm = build_swarm(id_keys)?;
+// 	let auth_manager = Arc::new(Mutex::new(AuthManager::default()));
 
-	for addr in binds {
-		log::info!("listen on {}", addr);
-		let addr: Multiaddr = addr.parse()?;
-		swarm.listen_on(addr.clone())?;
-	}
+// 	for addr in binds {
+// 		log::info!("listen on {}", addr);
+// 		let addr: Multiaddr = addr.parse()?;
+// 		swarm.listen_on(addr.clone())?;
+// 	}
 
-	// Build a list of (address, optional PeerId) for each peer string
-	let peer_addrs: Vec<(Multiaddr, Option<PeerId>)> = peers
-		.iter()
-		.filter_map(|addr| {
-			match addr.parse::<Multiaddr>() {
-				Ok(maddr) => {
-					// Try to extract the PeerId if the multiaddr ends with /p2p/<PeerId>
-					let peer_id_opt = maddr.iter().find_map(|p| {
-						if let Protocol::P2p(peer_id) = p {
-							Some(peer_id.clone())
-						} else {
-							None
-						}
-					});
-					Some((maddr, peer_id_opt))
-				}
-				Err(e) => {
-					log::error!("Failed to parse peer address {}: {}", addr, e);
-					None
-				}
-			}
-		})
-		.collect();
+// 	// Build a list of (address, optional PeerId) for each peer string
+// 	let peer_addrs: Vec<(Multiaddr, Option<PeerId>)> = peers
+// 		.iter()
+// 		.filter_map(|addr| {
+// 			match addr.parse::<Multiaddr>() {
+// 				Ok(maddr) => {
+// 					// Try to extract the PeerId if the multiaddr ends with /p2p/<PeerId>
+// 					let peer_id_opt = maddr.iter().find_map(|p| {
+// 						if let Protocol::P2p(peer_id) = p {
+// 							Some(peer_id.clone())
+// 						} else {
+// 							None
+// 						}
+// 					});
+// 					Some((maddr, peer_id_opt))
+// 				}
+// 				Err(e) => {
+// 					log::error!("Failed to parse peer address {}: {}", addr, e);
+// 					None
+// 				}
+// 			}
+// 		})
+// 		.collect();
 
-	let mut active_peers: HashSet<PeerId> = HashSet::new();
-	let mut active_addrs: HashSet<Multiaddr> = HashSet::new();
+// 	let mut active_peers: HashSet<PeerId> = HashSet::new();
+// 	let mut active_addrs: HashSet<Multiaddr> = HashSet::new();
 
-	// Initial dial to all peers
-	for (addr, _) in &peer_addrs {
-		log::info!("Dial peer {}", addr);
-		if let Err(e) = swarm.dial(addr.clone()) {
-			log::error!("Dial error {}: {}", addr, e);
-		}
-	}
+// 	// Initial dial to all peers
+// 	for (addr, _) in &peer_addrs {
+// 		log::info!("Dial peer {}", addr);
+// 		if let Err(e) = swarm.dial(addr.clone()) {
+// 			log::error!("Dial error {}: {}", addr, e);
+// 		}
+// 	}
 
-	log::info!("peers: {:?}", peer_addrs);
-	let mut reconnect_interval = interval(Duration::from_secs(5));
+// 	log::info!("peers: {:?}", peer_addrs);
+// 	let mut reconnect_interval = interval(Duration::from_secs(5));
 
-	loop {
-		tokio::select! {
-			_ = reconnect_interval.tick() => {
-				for (addr, peer_opt) in &peer_addrs {
-					// Determine if already connected
-					let is_connected = if let Some(peer_id) = peer_opt {
-						active_peers.contains(peer_id)
-					} else {
-						active_addrs.contains(addr)
-					};
-					if is_connected {
-						continue;
-					}
-					if let Err(e) = swarm.dial(addr.clone()) {
-						log::error!("Re-dial error {}: {}", addr, e);
-					} else {
-						log::info!("Re-dialing {}", addr);
-					}
-				}
-			}
-			event = swarm.select_next_some() => {
-				match event {
-					SwarmEvent::NewListenAddr { address, .. } => {
-						log::info!("Listening on {:?}", address);
-						let display_addr = libp2p_multiaddr(&address, local_ip, &peer_id);
-						log::info!("Peer reachable at {}", display_addr);
-					}
-					SwarmEvent::ConnectionEstablished { peer_id, endpoint, connection_id, .. } => {
-						log::info!("Connected to {:?}", peer_id);
-						active_peers.insert(peer_id);
-						// If dialer endpoint, record the address for reconnection tracking
-						if let ConnectedPoint::Dialer { address, .. } = endpoint {
-							active_addrs.insert(address.clone());
-						}
-					}
-					SwarmEvent::ConnectionClosed { peer_id, endpoint, .. } => {
-						log::info!("Connection closed: {:?}", peer_id);
-						active_peers.remove(&peer_id);
-						// Remove from address tracking if dialer endpoint
-						if let ConnectedPoint::Dialer { address, .. } = endpoint {
-							active_addrs.remove(&address);
-						}
-					}
-					SwarmEvent::Behaviour(event) => match event {
-						AgentEvent::FileMeta(event) => match event {
-							RequestResponseEvent::Message { peer, message, .. } => match message {
-								RequestResponseMessage::Request { request, channel, .. } => {
-									log::info!("File metadata request from {:?}: {:?}", peer, request);
-									let peer_id = peer.clone();
-									let auth_result = {
-										let mut manager = auth_manager.lock().await;
-										manager.authorize_file_request(&peer_id, &request)
-									};
-									let response = match auth_result {
-										Ok(()) => handle_file_request(request),
-										Err(reason) => {
-											log::warn!(
-												"Unauthorized file request from {:?}: {}",
-												peer,
-												reason
-											);
-											FileMetaResponse::Error(reason)
-										}
-									};
-									if let Err(err) = swarm
-										.behaviour_mut()
-										.file_meta
-										.send_response(channel, response)
-									{
-										log::error!("Failed to send file metadata response: {:?}", err);
-									}
-								}
-								RequestResponseMessage::Response { request_id, response } => {
-									log::info!(
-										"File metadata response {:?} from {:?}: {:?}",
-										request_id,
-										peer,
-										response
-									);
-								}
-							},
-							RequestResponseEvent::OutboundFailure { peer, request_id, error, .. } => {
-								log::warn!(
-									"File metadata outbound failure {:?} for {:?}: {:?}",
-									request_id,
-									peer,
-									error
-								);
-							}
-							RequestResponseEvent::InboundFailure { peer, request_id, error, .. } => {
-								log::warn!(
-									"File metadata inbound failure {:?} for {:?}: {:?}",
-									request_id,
-									peer,
-									error
-								);
-							}
-							RequestResponseEvent::ResponseSent { peer, request_id, .. } => {
-								log::debug!(
-									"File metadata response {:?} delivered to {:?}",
-									request_id,
-									peer
-								);
-							}
-						},
-						AgentEvent::Control(event) => match event {
-							RequestResponseEvent::Message { peer, message, .. } => match message {
-								RequestResponseMessage::Request { request, channel, .. } => {
-									log::info!("Control request from {:?}: {:?}", peer, request);
-									let response = {
-										let mut manager = auth_manager.lock().await;
-										manager.handle_control_request(&peer, request)
-									};
-									if let Err(err) = swarm
-										.behaviour_mut()
-										.control_plane
-										.send_response(channel, response)
-									{
-										log::error!("Failed to send control-plane response: {:?}", err);
-									}
-								}
-								RequestResponseMessage::Response { request_id, response } => {
-									log::debug!(
-										"Control response {:?} from {:?}: {:?}",
-										request_id,
-										peer,
-										response
-									);
-								}
-							},
-							RequestResponseEvent::OutboundFailure { peer, request_id, error, .. } => {
-								log::warn!(
-									"Control outbound failure {:?} for {:?}: {:?}",
-									request_id,
-									peer,
-									error
-								);
-							}
-							RequestResponseEvent::InboundFailure { peer, request_id, error, .. } => {
-								log::warn!(
-									"Control inbound failure {:?} for {:?}: {:?}",
-									request_id,
-									peer,
-									error
-								);
-							}
-							RequestResponseEvent::ResponseSent { peer, request_id, .. } => {
-								log::debug!(
-									"Control response {:?} delivered to {:?}",
-									request_id,
-									peer
-								);
-							}
-						},
-						AgentEvent::Ping(event) => {
-							log::debug!("Ping event: {:?}", event);
-						}
-					},
-					_ => {}
-				}
-			}
-		}
-	}
-}
+// 	loop {
+// 		tokio::select! {
+// 			_ = reconnect_interval.tick() => {
+// 				for (addr, peer_opt) in &peer_addrs {
+// 					// Determine if already connected
+// 					let is_connected = if let Some(peer_id) = peer_opt {
+// 						active_peers.contains(peer_id)
+// 					} else {
+// 						active_addrs.contains(addr)
+// 					};
+// 					if is_connected {
+// 						continue;
+// 					}
+// 					if let Err(e) = swarm.dial(addr.clone()) {
+// 						log::error!("Re-dial error {}: {}", addr, e);
+// 					} else {
+// 						log::info!("Re-dialing {}", addr);
+// 					}
+// 				}
+// 			}
+// 			event = swarm.select_next_some() => {
+// 				match event {
+// 					SwarmEvent::NewListenAddr { address, .. } => {
+// 						log::info!("Listening on {:?}", address);
+// 						let display_addr = libp2p_multiaddr(&address, local_ip, &peer_id);
+// 						log::info!("Peer reachable at {}", display_addr);
+// 					}
+// 					SwarmEvent::ConnectionEstablished { peer_id, endpoint, connection_id, .. } => {
+// 						log::info!("Connected to {:?}", peer_id);
+// 						active_peers.insert(peer_id);
+// 						// If dialer endpoint, record the address for reconnection tracking
+// 						if let ConnectedPoint::Dialer { address, .. } = endpoint {
+// 							active_addrs.insert(address.clone());
+// 						}
+// 					}
+// 					SwarmEvent::ConnectionClosed { peer_id, endpoint, .. } => {
+// 						log::info!("Connection closed: {:?}", peer_id);
+// 						active_peers.remove(&peer_id);
+// 						// Remove from address tracking if dialer endpoint
+// 						if let ConnectedPoint::Dialer { address, .. } = endpoint {
+// 							active_addrs.remove(&address);
+// 						}
+// 					}
+// 					SwarmEvent::Behaviour(event) => match event {
+// 						AgentEvent::FileMeta(event) => match event {
+// 							RequestResponseEvent::Message { peer, message, .. } => match message {
+// 								RequestResponseMessage::Request { request, channel, .. } => {
+// 									log::info!("File metadata request from {:?}: {:?}", peer, request);
+// 									let peer_id = peer.clone();
+// 									let auth_result = {
+// 										let mut manager = auth_manager.lock().await;
+// 										manager.authorize_file_request(&peer_id, &request)
+// 									};
+// 									let response = match auth_result {
+// 										Ok(()) => handle_file_request(request),
+// 										Err(reason) => {
+// 											log::warn!(
+// 												"Unauthorized file request from {:?}: {}",
+// 												peer,
+// 												reason
+// 											);
+// 											FileMetaResponse::Error(reason)
+// 										}
+// 									};
+// 									if let Err(err) = swarm
+// 										.behaviour_mut()
+// 										.file_meta
+// 										.send_response(channel, response)
+// 									{
+// 										log::error!("Failed to send file metadata response: {:?}", err);
+// 									}
+// 								}
+// 								RequestResponseMessage::Response { request_id, response } => {
+// 									log::info!(
+// 										"File metadata response {:?} from {:?}: {:?}",
+// 										request_id,
+// 										peer,
+// 										response
+// 									);
+// 								}
+// 							},
+// 							RequestResponseEvent::OutboundFailure { peer, request_id, error, .. } => {
+// 								log::warn!(
+// 									"File metadata outbound failure {:?} for {:?}: {:?}",
+// 									request_id,
+// 									peer,
+// 									error
+// 								);
+// 							}
+// 							RequestResponseEvent::InboundFailure { peer, request_id, error, .. } => {
+// 								log::warn!(
+// 									"File metadata inbound failure {:?} for {:?}: {:?}",
+// 									request_id,
+// 									peer,
+// 									error
+// 								);
+// 							}
+// 							RequestResponseEvent::ResponseSent { peer, request_id, .. } => {
+// 								log::debug!(
+// 									"File metadata response {:?} delivered to {:?}",
+// 									request_id,
+// 									peer
+// 								);
+// 							}
+// 						},
+// 						AgentEvent::Control(event) => match event {
+// 							RequestResponseEvent::Message { peer, message, .. } => match message {
+// 								RequestResponseMessage::Request { request, channel, .. } => {
+// 									log::info!("Control request from {:?}: {:?}", peer, request);
+// 									let response = {
+// 										let mut manager = auth_manager.lock().await;
+// 										manager.handle_control_request(&peer, request)
+// 									};
+// 									if let Err(err) = swarm
+// 										.behaviour_mut()
+// 										.control_plane
+// 										.send_response(channel, response)
+// 									{
+// 										log::error!("Failed to send control-plane response: {:?}", err);
+// 									}
+// 								}
+// 								RequestResponseMessage::Response { request_id, response } => {
+// 									log::debug!(
+// 										"Control response {:?} from {:?}: {:?}",
+// 										request_id,
+// 										peer,
+// 										response
+// 									);
+// 								}
+// 							},
+// 							RequestResponseEvent::OutboundFailure { peer, request_id, error, .. } => {
+// 								log::warn!(
+// 									"Control outbound failure {:?} for {:?}: {:?}",
+// 									request_id,
+// 									peer,
+// 									error
+// 								);
+// 							}
+// 							RequestResponseEvent::InboundFailure { peer, request_id, error, .. } => {
+// 								log::warn!(
+// 									"Control inbound failure {:?} for {:?}: {:?}",
+// 									request_id,
+// 									peer,
+// 									error
+// 								);
+// 							}
+// 							RequestResponseEvent::ResponseSent { peer, request_id, .. } => {
+// 								log::debug!(
+// 									"Control response {:?} delivered to {:?}",
+// 									request_id,
+// 									peer
+// 								);
+// 							}
+// 						},
+// 						AgentEvent::Ping(event) => {
+// 							log::debug!("Ping event: {:?}", event);
+// 						}
+// 					},
+// 					_ => {}
+// 				}
+// 			}
+// 		}
+// 	}
+// }

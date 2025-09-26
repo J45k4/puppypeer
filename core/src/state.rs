@@ -1,4 +1,4 @@
-use libp2p::PeerId;
+use libp2p::{swarm::ConnectionId, PeerId};
 
 pub const FLAG_READ: u8 = 0x01;
 pub const FLAG_WRITE: u8 = 0x02;
@@ -60,14 +60,15 @@ pub struct Auth {
 }
 
 pub struct Connection {
-    peer: PeerId,
+    pub peer_id: PeerId,
+    pub connection_id: ConnectionId
 }
 
 pub struct State {
-    me: PeerId,
-    relationships: Vec<Relationship>,
-    auths: Vec<Auth>,
-    connections: Vec<Connection>,
+    pub me: PeerId,
+    pub relationships: Vec<Relationship>,
+    pub auths: Vec<Auth>,
+    pub connections: Vec<Connection>,
 }
 
 impl State {

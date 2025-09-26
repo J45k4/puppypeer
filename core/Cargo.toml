@@ -14,7 +14,7 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 infer = "0.19"
-libp2p = { version = "0.56", features = ["tokio", "tcp", "identify", "noise", "yamux", "ping", "macros", "request-response", "json"] }
+libp2p = { version = "0.56", features = ["tokio", "tcp", "identify", "noise", "yamux", "ping", "macros", "request-response", "json", "mdns"] }
 log = "0.4"
 mime_guess = "2"
 rayon = { version = "1", optional = true }
