@@ -1,6 +1,7 @@
+mod app;
+mod db;
 pub mod p2p;
 pub mod scan;
-pub mod wait_group;
 mod state;
-mod db;
-mod app;
+pub mod wait_group;
+pub use app::PuppyPeer;
