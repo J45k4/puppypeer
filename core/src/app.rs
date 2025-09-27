@@ -156,14 +156,14 @@ impl App {
 	}
 }
 
-pub struct PuppyPeer {
-
-}
+pub struct PuppyPeer {}
 
 impl PuppyPeer {
 	pub fn new() -> Self {
-		PuppyPeer {
+		PuppyPeer {}
+	}
 
-		}
+	pub fn get_state() -> State {
+		State::default()
 	}
 }

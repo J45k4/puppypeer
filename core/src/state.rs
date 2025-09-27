@@ -78,12 +78,19 @@ pub struct DiscoveredPeer {
 }
 
 #[derive(Clone, Debug)]
+pub struct Peer {
+	pub id: PeerId,
+	pub name: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub struct State {
 	pub me: PeerId,
 	pub relationships: Vec<Relationship>,
 	pub auths: Vec<Auth>,
 	pub connections: Vec<Connection>,
 	pub discovered_peers: Vec<DiscoveredPeer>,
+	pub peers: Vec<Peer>,
 }
 
 impl Default for State {
@@ -94,6 +101,7 @@ impl Default for State {
 			auths: Vec::new(),
 			connections: Vec::new(),
 			discovered_peers: Vec::new(),
+			peers: Vec::new(),
 		}
 	}
 }

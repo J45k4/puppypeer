@@ -1,18 +1,21 @@
 use std::io::{self, Stdout};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::{
 	event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
 	execute,
 	terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use puppyagent_core::PuppyPeer;
+use puppyagent_core::{PuppyPeer, State};
 use ratatui::{
 	Terminal,
 	backend::CrosstermBackend,
 	layout::{Constraint, Direction, Layout},
 	style::{Color, Modifier, Style},
-	widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap, canvas::{Canvas, Line, Points}},
+	widgets::{
+		Block, Borders, List, ListItem, ListState, Paragraph, Wrap,
+		canvas::{Canvas, Line, Points},
+	},
 };
 
 enum Mode {
@@ -40,17 +43,28 @@ impl GraphView {
 		let peers = base
 			.into_iter()
 			.enumerate()
-			.map(|(i, p)| PeerNode { id: p.id, angle: (i as f64) * (std::f64::consts::TAU / count as f64) })
+			.map(|(i, p)| PeerNode {
+				id: p.id,
+				angle: (i as f64) * (std::f64::consts::TAU / count as f64),
+			})
 			.collect();
 		Self { peers, selected: 0 }
 	}
 	fn next(&mut self) {
-		if self.peers.is_empty() { return; }
+		if self.peers.is_empty() {
+			return;
+		}
 		self.selected = (self.selected + 1) % self.peers.len();
 	}
 	fn previous(&mut self) {
-		if self.peers.is_empty() { return; }
-		if self.selected == 0 { self.selected = self.peers.len() - 1; } else { self.selected -= 1; }
+		if self.peers.is_empty() {
+			return;
+		}
+		if self.selected == 0 {
+			self.selected = self.peers.len() - 1;
+		} else {
+			self.selected -= 1;
+		}
 	}
 	fn refresh(&mut self) {
 		// Placeholder: recompute angles (could reflect dynamic additions)
@@ -59,9 +73,14 @@ impl GraphView {
 		self.peers = base_ids
 			.into_iter()
 			.enumerate()
-			.map(|(i, id)| PeerNode { id, angle: (i as f64) * (std::f64::consts::TAU / count as f64) })
+			.map(|(i, id)| PeerNode {
+				id,
+				angle: (i as f64) * (std::f64::consts::TAU / count as f64),
+			})
 			.collect();
-		if self.selected >= self.peers.len() { self.selected = 0; }
+		if self.selected >= self.peers.len() {
+			self.selected = 0;
+		}
 	}
 }
 
@@ -161,7 +180,11 @@ struct ShellApp {
 	menu_state: ListState,
 	status_line: String,
 	mode: Mode,
-    peer: PuppyPeer
+	_peer: PuppyPeer,
+	last_refresh: Instant,
+	refresh_interval: Duration,
+	refresh_count: u64,
+	latest_state: Option<State>,
 }
 
 impl ShellApp {
@@ -170,11 +193,21 @@ impl ShellApp {
 		state.select(Some(0));
 		Self {
 			should_quit: false,
-			menu_items: vec!["peers", "peers graph", "create token", "create user", "quit"],
+			menu_items: vec![
+				"peers",
+				"peers graph",
+				"create token",
+				"create user",
+				"quit",
+			],
 			menu_state: state,
 			status_line: "Use ↑/↓ to navigate, Enter to select, q to quit".to_string(),
 			mode: Mode::Menu,
-            peer: PuppyPeer::new(),
+			_peer: PuppyPeer::new(),
+			last_refresh: Instant::now(),
+			refresh_interval: Duration::from_secs(5),
+			refresh_count: 0,
+			latest_state: None,
 		}
 	}
 
@@ -262,11 +295,19 @@ impl ShellApp {
 					_ => {}
 				},
 				Mode::PeersGraph(graph) => match key.code {
-					KeyCode::Esc => { self.mode = Mode::Menu; self.status_line = "Back to menu".into(); }
+					KeyCode::Esc => {
+						self.mode = Mode::Menu;
+						self.status_line = "Back to menu".into();
+					}
 					KeyCode::Left => graph.previous(),
 					KeyCode::Right => graph.next(),
-					KeyCode::Char('r') => { graph.refresh(); self.status_line = "Refreshed graph (placeholder)".into(); }
-					KeyCode::Char('q') => { self.should_quit = true; }
+					KeyCode::Char('r') => {
+						graph.refresh();
+						self.status_line = "Refreshed graph (placeholder)".into();
+					}
+					KeyCode::Char('q') => {
+						self.should_quit = true;
+					}
 					_ => {}
 				},
 				Mode::CreateUser(form) => {
@@ -310,6 +351,56 @@ impl ShellApp {
 			}
 		}
 	}
+
+	fn periodic_refresh(&mut self) {
+		if self.last_refresh.elapsed() >= self.refresh_interval {
+			// Pull latest core state
+			let state = PuppyPeer::get_state();
+			self.latest_state = Some(state.clone());
+			// Update active views from state (if open)
+			match &mut self.mode {
+				Mode::Peers(view) => {
+					if !state.peers.is_empty() {
+						view.peers = state
+							.peers
+							.iter()
+							.enumerate()
+							.map(|(_i, p)| PeerRow {
+								id: format!("{}", p.id),
+								address: "".into(), // address not yet in State, placeholder
+								status: "".into(),  // could derive from connections later
+							})
+							.collect();
+						if view.selected >= view.peers.len() { view.selected = 0; }
+						self.status_line = format!("Auto-refreshed peers ({} entries)", view.peers.len());
+					} else {
+						view.peers.clear();
+						self.status_line = "Auto-refreshed peers (none)".into();
+					}
+				}
+				Mode::PeersGraph(graph) => {
+					if !state.peers.is_empty() {
+						let count = state.peers.len();
+						graph.peers = state
+							.peers
+							.iter()
+							.enumerate()
+							.map(|(i, p)| PeerNode { id: format!("{}", p.id), angle: (i as f64) * (std::f64::consts::TAU / count as f64) })
+							.collect();
+						if graph.selected >= graph.peers.len() { graph.selected = 0; }
+						self.status_line = format!("Auto-refreshed graph ({} nodes)", graph.peers.len());
+					} else {
+						graph.peers.clear();
+						self.status_line = "Auto-refreshed graph (none)".into();
+					}
+				}
+				_ => {}
+			}
+			// legacy post-refresh per-mode adjustments removed (state-based updates already applied)
+			self.refresh_count += 1;
+			self.last_refresh = Instant::now();
+		}
+	}
 }
 
 pub fn run() -> io::Result<()> {
@@ -330,6 +421,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> 
 	let mut app = ShellApp::new();
 
 	while !app.should_quit {
+		// Periodic refresh hook
+		app.periodic_refresh();
 		terminal.draw(|f| {
 			let size = f.size();
 
@@ -512,11 +605,14 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> 
 					let chunks = Layout::default()
 						.direction(Direction::Vertical)
 						.margin(1)
-						.constraints([
-							Constraint::Length(3), // title
-							Constraint::Min(5),    // canvas
-							Constraint::Length(1), // status
-						].as_ref())
+						.constraints(
+							[
+								Constraint::Length(3), // title
+								Constraint::Min(5),    // canvas
+								Constraint::Length(1), // status
+							]
+							.as_ref(),
+						)
 						.split(size);
 
 					let header = Paragraph::new("Peers Graph")
@@ -525,10 +621,19 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> 
 					f.render_widget(header, chunks[0]);
 
 					// Canvas coordinate system: we'll use (-1.2,-1.0) to (1.2,1.0) to leave some margin
-					let peers_clone = graph.peers.iter().enumerate().map(|(i, n)| (i, n.id.clone(), n.angle)).collect::<Vec<_>>();
+					let peers_clone = graph
+						.peers
+						.iter()
+						.enumerate()
+						.map(|(i, n)| (i, n.id.clone(), n.angle))
+						.collect::<Vec<_>>();
 					let selected = graph.selected;
 					let canvas = Canvas::default()
-						.block(Block::default().borders(Borders::ALL).title("Graph (r=refresh, ←/→ select, Esc back)"))
+						.block(
+							Block::default()
+								.borders(Borders::ALL)
+								.title("Graph (r=refresh, ←/→ select, Esc back)"),
+						)
 						.x_bounds([-1.3, 1.3])
 						.y_bounds([-1.1, 1.1])
 						.paint(move |ctx| {
@@ -537,10 +642,17 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> 
 								let x1 = a1.cos();
 								let y1 = a1.sin();
 								for (i2, _id2, a2) in &peers_clone {
-									if i1 < i2 { // avoid duplicates
+									if i1 < i2 {
+										// avoid duplicates
 										let x2 = a2.cos();
 										let y2 = a2.sin();
-										ctx.draw(&Line { x1, y1, x2, y2, color: Color::DarkGray });
+										ctx.draw(&Line {
+											x1,
+											y1,
+											x2,
+											y2,
+											color: Color::DarkGray,
+										});
 									}
 								}
 							}
@@ -548,8 +660,15 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> 
 							for (i, id, a) in &peers_clone {
 								let x = a.cos();
 								let y = a.sin();
-								let color = if *i == selected { Color::Cyan } else { Color::White };
-								ctx.draw(&Points { coords: &[(x, y)], color });
+								let color = if *i == selected {
+									Color::Cyan
+								} else {
+									Color::White
+								};
+								ctx.draw(&Points {
+									coords: &[(x, y)],
+									color,
+								});
 								// Simple label: first 5 chars radial outward
 								let label: String = id.chars().take(5).collect();
 								let lx = x * 1.1;
