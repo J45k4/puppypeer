@@ -26,12 +26,7 @@ impl App {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         
         App {
-            state: State {
-                me: peer_id,
-                connections: Vec::new(),
-                auths: Vec::new(),
-                relationships: Vec::new(),
-            },
+            state: State::default(),
             swarm,
             rx,
         }
@@ -48,11 +43,13 @@ impl App {
                     mdns::Event::Discovered(items) => {
                         for (peer_id, multiaddr) in items {
                             log::info!("mDNS discovered peer {} at {}", peer_id, multiaddr);
+							self.state.peer_discovered(peer_id, multiaddr);
                         }
                     },
                     mdns::Event::Expired(items) => {
                         for (peer_id, multiaddr) in items {
                             log::info!("mDNS expired peer {} at {}", peer_id, multiaddr);
+							self.state.peer_expired(peer_id, multiaddr);
                         }
                     },
                 }

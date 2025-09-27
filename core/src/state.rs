@@ -1,4 +1,4 @@
-use libp2p::{swarm::ConnectionId, PeerId};
+use libp2p::{swarm::ConnectionId, Multiaddr, PeerId};
 
 pub const FLAG_READ: u8 = 0x01;
 pub const FLAG_WRITE: u8 = 0x02;
@@ -64,11 +64,18 @@ pub struct Connection {
     pub connection_id: ConnectionId
 }
 
+pub struct DiscoveredPeer {
+	pub peer_id: PeerId,
+	pub multiaddr: Multiaddr,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct State {
     pub me: PeerId,
     pub relationships: Vec<Relationship>,
     pub auths: Vec<Auth>,
     pub connections: Vec<Connection>,
+	pub discovered_peers: Vec<DiscoveredPeer>,
 }
 
 impl State {
@@ -105,4 +112,14 @@ impl State {
 
         false
     }
+
+	pub fn peer_discovered(&mut self, peer_id: PeerId, multiaddr: Multiaddr) {
+		if !self.discovered_peers.iter().any(|p| p.peer_id == peer_id) {
+			self.discovered_peers.push(DiscoveredPeer { peer_id, multiaddr });
+		}
+	}
+
+	pub fn peer_expired(&mut self, peer_id: PeerId, multiaddr: Multiaddr) {
+		self.discovered_peers.retain(|p| !(p.peer_id == peer_id && p.multiaddr == multiaddr));
+	}
 }
