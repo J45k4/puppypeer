@@ -30,8 +30,8 @@ use uuid::Uuid;
 
 use crate::wait_group::WaitGroupGuard;
 
-const FILE_META_PROTOCOL: &str = "/puppy/filemeta/1.0.0";
-const CONTROL_PROTOCOL: &str = "/puppy/control/1.0.0";
+const FILE_META_PROTOCOL: &str = "/puppy/filemeta/0.0.1";
+const CONTROL_PROTOCOL: &str = "/puppy/control/0.0.1";
 const MAX_FILE_CHUNK: u64 = 4 * 1024 * 1024; // 4 MiB per transfer chunk
 const OWNER_ROLE: &str = "owner";
 const VIEWER_ROLE: &str = "viewer";
