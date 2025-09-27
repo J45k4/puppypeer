@@ -1,6 +1,6 @@
 use args::Command;
 use clap::Parser;
-use puppyagent_core::wait_group::WaitGroup;
+use puppyagent_core::{PuppyPeer, wait_group::WaitGroup};
 use uuid::Uuid;
 
 mod args;
@@ -53,7 +53,7 @@ async fn main() {
 				log::info!("update completed successfully");
 				return;
 			}
-			Command::Shell => {
+			Command::Tui => {
 				if let Err(err) = shell::run() {
 					log::error!("shell error: {err:?}");
 					std::process::exit(1);
@@ -66,10 +66,8 @@ async fn main() {
 			}
 		},
 		None => {
-			if let Err(err) = shell::run() {
-				log::error!("shell error: {err:?}");
-				std::process::exit(1);
-			}
+			let peer = PuppyPeer::new();
+			peer.wait().await;
 			return;
 		}
 	}

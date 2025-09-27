@@ -683,6 +683,13 @@ fn path_matches(grant: &str, request: &str) -> bool {
 
 /// Load or generate an Ed25519 keypair and persist it to disk.
 pub fn load_or_generate_keypair(path: &Path) -> Result<identity::Keypair> {
+	// Ensure parent directory exists if a directory component was provided.
+	if let Some(parent) = path.parent() {
+		if !parent.as_os_str().is_empty() && !parent.exists() {
+			std::fs::create_dir_all(parent)?;
+			log::info!("created key directory {}", parent.display());
+		}
+	}
 	if path.exists() {
 		let bytes = fs::read(path)?;
 		let key = Keypair::from_protobuf_encoding(&bytes)?;

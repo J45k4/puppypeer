@@ -21,6 +21,6 @@ pub enum Command {
 	Install,
 	Uninstall,
 	Update { version: Option<String> },
-	Shell,
+	Tui,
 	Daemon,
 }

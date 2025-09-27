@@ -6,7 +6,10 @@ use crate::{
 };
 use futures::StreamExt;
 use libp2p::{PeerId, Swarm, mdns, swarm::SwarmEvent};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::{
+	sync::{mpsc::UnboundedReceiver, oneshot},
+	task::JoinHandle,
+};
 
 pub enum Command {
 	Connect {
@@ -25,11 +28,38 @@ impl App {
 	pub fn new() -> Self {
 		let key_path = env::var("KEYPAIR").unwrap_or_else(|_| String::from("peer_keypair.bin"));
 		let key_path = Path::new(&key_path);
+		if !key_path.exists() {
+			log::warn!(
+				"keypair file {} does not exist, generating new keypair",
+				key_path.display()
+			);
+		}
 		let id_keys = load_or_generate_keypair(key_path).unwrap();
 		let peer_id = PeerId::from(id_keys.public());
 
-		let swarm = build_swarm(id_keys, peer_id).unwrap();
+		let mut swarm = build_swarm(id_keys, peer_id).unwrap();
 		let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+		// Listen on all interfaces TCP/8336. Multiaddr requires explicit /tcp/ separator.
+		// Allow overriding the listen address via env:
+		//   PUPPYAGENT_LISTEN=/ip4/0.0.0.0/tcp/9000
+		// or just the port via PUPPYAGENT_PORT=9000
+		let listen_addr: libp2p::Multiaddr = if let Ok(ma) = env::var("PUPPYAGENT_LISTEN") {
+			match ma.parse() {
+				Ok(m) => m,
+				Err(e) => panic!("invalid PUPPYAGENT_LISTEN multiaddr '{ma}': {e}"),
+			}
+		} else {
+			let port: u16 = env::var("PORT")
+				.ok()
+				.and_then(|v| v.parse().ok())
+				.unwrap_or(8336);
+			format!("/ip4/0.0.0.0/tcp/{port}").parse().expect("valid constructed multiaddr")
+		};
+		if let Err(err) = swarm.listen_on(listen_addr.clone()) {
+			panic!("failed to start listener on {listen_addr}: {err}");
+		}
+		log::info!("listening on {listen_addr}");
 
 		App {
 			state: State::default(),
@@ -61,6 +91,7 @@ impl App {
 	}
 
 	async fn handle_swarm_event(&mut self, event: SwarmEvent<AgentEvent>) {
+		log::info!("SwarmEvent: {:?}", event);
 		match event {
 			SwarmEvent::Behaviour(b) => self.handle_agent_event(b).await,
 			SwarmEvent::ConnectionEstablished {
@@ -91,42 +122,44 @@ impl App {
 				connection_id,
 				local_addr,
 				send_back_addr,
-			} => todo!(),
+			} => {}
 			SwarmEvent::IncomingConnectionError {
 				connection_id,
 				local_addr,
 				send_back_addr,
 				error,
 				peer_id,
-			} => todo!(),
+			} => {}
 			SwarmEvent::OutgoingConnectionError {
 				connection_id,
 				peer_id,
 				error,
-			} => todo!(),
+			} => {}
 			SwarmEvent::NewListenAddr {
 				listener_id,
 				address,
-			} => todo!(),
+			} => {
+				log::info!("listener {:?} listening on {:?}", listener_id, address);
+			}
 			SwarmEvent::ExpiredListenAddr {
 				listener_id,
 				address,
-			} => todo!(),
+			} => {}
 			SwarmEvent::ListenerClosed {
 				listener_id,
 				addresses,
 				reason,
-			} => todo!(),
-			SwarmEvent::ListenerError { listener_id, error } => todo!(),
+			} => {}
+			SwarmEvent::ListenerError { listener_id, error } => {}
 			SwarmEvent::Dialing {
 				peer_id,
 				connection_id,
-			} => todo!(),
-			SwarmEvent::NewExternalAddrCandidate { address } => todo!(),
-			SwarmEvent::ExternalAddrConfirmed { address } => todo!(),
-			SwarmEvent::ExternalAddrExpired { address } => todo!(),
-			SwarmEvent::NewExternalAddrOfPeer { peer_id, address } => todo!(),
-			_ => todo!(),
+			} => {}
+			SwarmEvent::NewExternalAddrCandidate { address } => {}
+			SwarmEvent::ExternalAddrConfirmed { address } => {}
+			SwarmEvent::ExternalAddrExpired { address } => {}
+			SwarmEvent::NewExternalAddrOfPeer { peer_id, address } => {}
+			_ => {}
 		}
 	}
 
@@ -139,6 +172,7 @@ impl App {
 	}
 
 	pub async fn run(&mut self) {
+		//log::info!("run");
 		tokio::select! {
 			event = self.swarm.select_next_some() => {
 				self.handle_swarm_event(event).await;
@@ -156,14 +190,51 @@ impl App {
 	}
 }
 
-pub struct PuppyPeer {}
+pub struct PuppyPeer {
+	shutdown_tx: Option<oneshot::Sender<()>>,
+	handle: JoinHandle<()>,
+}
 
 impl PuppyPeer {
 	pub fn new() -> Self {
-		PuppyPeer {}
+		// channel to request shutdown
+		let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+		let handle: JoinHandle<()> = tokio::spawn(async move {
+			let mut app = App::new();
+			loop {
+				tokio::select! {
+					_ = &mut shutdown_rx => {
+						log::info!("PuppyPeer shutting down");
+						break;
+					}
+					_ = app.run() => {}
+				}
+			}
+		});
+
+		PuppyPeer {
+			shutdown_tx: Some(shutdown_tx),
+			handle,
+		}
 	}
 
 	pub fn get_state() -> State {
 		State::default()
+	}
+
+	/// Wait for the peer until Ctrl+C (SIGINT) then perform a graceful shutdown.
+	pub async fn wait(mut self) {
+		// Wait for Ctrl+C
+		if let Err(e) = tokio::signal::ctrl_c().await {
+			log::error!("failed to listen for ctrl_c: {e}");
+		}
+		log::info!("interrupt received, shutting down");
+		if let Some(tx) = self.shutdown_tx.take() {
+			let _ = tx.send(());
+		}
+		// Await the background task
+		if let Err(e) = self.handle.await {
+			log::error!("task join error: {e}");
+		}
 	}
 }

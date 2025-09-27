@@ -1,4 +1,5 @@
 use std::io::{self, Stdout};
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use crossterm::{
@@ -6,17 +7,20 @@ use crossterm::{
 	execute,
 	terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use libp2p::PeerId;
 use puppyagent_core::{PuppyPeer, State};
 use ratatui::{
-	Terminal,
+	Frame, Terminal,
 	backend::CrosstermBackend,
-	layout::{Constraint, Direction, Layout},
+	layout::{Constraint, Direction, Layout, Rect},
 	style::{Color, Modifier, Style},
 	widgets::{
 		Block, Borders, List, ListItem, ListState, Paragraph, Wrap,
 		canvas::{Canvas, Line, Points},
 	},
 };
+
+const LOCAL_LISTEN_MULTIADDR: &str = "/ip4/0.0.0.0:8336";
 
 enum Mode {
 	Menu,
@@ -124,6 +128,7 @@ impl PeersView {
 	}
 }
 
+#[derive(Clone)]
 struct PeerRow {
 	id: String,
 	address: String,
@@ -371,8 +376,11 @@ impl ShellApp {
 								status: "".into(),  // could derive from connections later
 							})
 							.collect();
-						if view.selected >= view.peers.len() { view.selected = 0; }
-						self.status_line = format!("Auto-refreshed peers ({} entries)", view.peers.len());
+						if view.selected >= view.peers.len() {
+							view.selected = 0;
+						}
+						self.status_line =
+							format!("Auto-refreshed peers ({} entries)", view.peers.len());
 					} else {
 						view.peers.clear();
 						self.status_line = "Auto-refreshed peers (none)".into();
@@ -385,10 +393,16 @@ impl ShellApp {
 							.peers
 							.iter()
 							.enumerate()
-							.map(|(i, p)| PeerNode { id: format!("{}", p.id), angle: (i as f64) * (std::f64::consts::TAU / count as f64) })
+							.map(|(i, p)| PeerNode {
+								id: format!("{}", p.id),
+								angle: (i as f64) * (std::f64::consts::TAU / count as f64),
+							})
 							.collect();
-						if graph.selected >= graph.peers.len() { graph.selected = 0; }
-						self.status_line = format!("Auto-refreshed graph ({} nodes)", graph.peers.len());
+						if graph.selected >= graph.peers.len() {
+							graph.selected = 0;
+						}
+						self.status_line =
+							format!("Auto-refreshed graph ({} nodes)", graph.peers.len());
 					} else {
 						graph.peers.clear();
 						self.status_line = "Auto-refreshed graph (none)".into();
@@ -399,6 +413,95 @@ impl ShellApp {
 			// legacy post-refresh per-mode adjustments removed (state-based updates already applied)
 			self.refresh_count += 1;
 			self.last_refresh = Instant::now();
+		}
+	}
+
+	fn gather_known_addresses(&self, peer_id: &str) -> Vec<String> {
+		if let Some(state) = &self.latest_state {
+			if let Ok(target) = PeerId::from_str(peer_id) {
+				let mut addresses = Vec::new();
+				for discovered in &state.discovered_peers {
+					if discovered.peer_id == target {
+						addresses.push(discovered.multiaddr.to_string());
+					}
+				}
+				addresses
+			} else {
+				Vec::new()
+			}
+		} else {
+			Vec::new()
+		}
+	}
+
+	fn peer_panel_content(&self) -> (String, Vec<String>) {
+		match &self.mode {
+			Mode::Peers(view) if !view.peers.is_empty() => {
+				let peer = &view.peers[view.selected];
+				let mut lines = Vec::new();
+				lines.push(format!("Peer ID: {}", peer.id));
+				let mut addresses = Vec::new();
+				if !peer.address.is_empty() {
+					addresses.push(peer.address.clone());
+				}
+				for addr in self.gather_known_addresses(&peer.id) {
+					if !addresses.contains(&addr) {
+						addresses.push(addr);
+					}
+				}
+				match addresses.len() {
+					0 => lines.push("Dial Address: unknown".into()),
+					1 => lines.push(format!("Dial Address: {}", addresses[0])),
+					_ => {
+						lines.push("Dial Addresses:".into());
+						for (idx, addr) in addresses.iter().enumerate() {
+							lines.push(format!("{}: {}", idx + 1, addr));
+						}
+					}
+				}
+				if !peer.status.is_empty() {
+					lines.push(format!("Status: {}", peer.status));
+				}
+				("Selected Peer".into(), lines)
+			}
+			Mode::PeersGraph(graph) if !graph.peers.is_empty() => {
+				let node = &graph.peers[graph.selected];
+				let mut lines = Vec::new();
+				lines.push(format!("Peer ID: {}", node.id));
+				let addresses = self.gather_known_addresses(&node.id);
+				match addresses.len() {
+					0 => lines.push("Dial Address: unknown".into()),
+					1 => lines.push(format!("Dial Address: {}", addresses[0])),
+					_ => {
+						lines.push("Dial Addresses:".into());
+						for (idx, addr) in addresses.iter().enumerate() {
+							lines.push(format!("{}: {}", idx + 1, addr));
+						}
+					}
+				}
+				("Graph Selection".into(), lines)
+			}
+			_ => {
+				if let Some(state) = &self.latest_state {
+					let mut lines = Vec::new();
+					lines.push(format!("Peer ID: {}", state.me));
+					lines.push(format!("Dial Address: {}", LOCAL_LISTEN_MULTIADDR));
+					if state.discovered_peers.is_empty() {
+						lines.push("Known peers: none".into());
+					} else {
+						lines.push("Known peers:".into());
+						for (idx, peer) in state.discovered_peers.iter().take(5).enumerate() {
+							lines.push(format!("{}: {}", idx + 1, peer.multiaddr));
+						}
+						if state.discovered_peers.len() > 5 {
+							lines.push(format!("(+{} more)", state.discovered_peers.len() - 5));
+						}
+					}
+					("Local Peer".into(), lines)
+				} else {
+					("Peer Info".into(), vec!["Peer state unavailable".into()])
+				}
+			}
 		}
 	}
 }
@@ -425,21 +528,24 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> 
 		app.periodic_refresh();
 		terminal.draw(|f| {
 			let size = f.size();
+			let columns = Layout::default()
+				.direction(Direction::Horizontal)
+				.margin(1)
+				.constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+				.split(size);
+			let main_area = columns[0];
+			let info_area = columns[1];
 
 			match &app.mode {
 				Mode::Menu => {
 					let chunks = Layout::default()
 						.direction(Direction::Vertical)
-						.margin(1)
-						.constraints(
-							[
-								Constraint::Length(3), // title / help
-								Constraint::Min(5),    // menu list
-								Constraint::Length(1), // status line
-							]
-							.as_ref(),
-						)
-						.split(size);
+						.constraints([
+							Constraint::Length(3), // title / help
+							Constraint::Min(5),    // menu list
+							Constraint::Length(1), // status line
+						])
+						.split(main_area);
 
 					let header = Paragraph::new("PuppyPeer")
 						.style(Style::default().fg(Color::Yellow))
@@ -466,16 +572,12 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> 
 					use ratatui::widgets::{Row, Table};
 					let chunks = Layout::default()
 						.direction(Direction::Vertical)
-						.margin(1)
-						.constraints(
-							[
-								Constraint::Length(3), // title
-								Constraint::Min(5),    // table
-								Constraint::Length(1), // status
-							]
-							.as_ref(),
-						)
-						.split(size);
+						.constraints([
+							Constraint::Length(3), // title
+							Constraint::Min(5),    // table
+							Constraint::Length(1), // status
+						])
+						.split(main_area);
 
 					let header = Paragraph::new("Peers")
 						.style(Style::default().fg(Color::Green))
@@ -527,16 +629,12 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> 
 				Mode::CreateUser(form) => {
 					let chunks = Layout::default()
 						.direction(Direction::Vertical)
-						.margin(1)
-						.constraints(
-							[
-								Constraint::Length(3), // title
-								Constraint::Min(5),    // form
-								Constraint::Length(1), // status
-							]
-							.as_ref(),
-						)
-						.split(size);
+						.constraints([
+							Constraint::Length(3), // title
+							Constraint::Min(5),    // form
+							Constraint::Length(1), // status
+						])
+						.split(main_area);
 
 					let header = Paragraph::new("Create User")
 						.style(Style::default().fg(Color::Magenta))
@@ -546,14 +644,11 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> 
 					let form_chunks = Layout::default()
 						.direction(Direction::Vertical)
 						.margin(1)
-						.constraints(
-							[
-								Constraint::Length(3),
-								Constraint::Length(3),
-								Constraint::Min(1),
-							]
-							.as_ref(),
-						)
+						.constraints([
+							Constraint::Length(3),
+							Constraint::Length(3),
+							Constraint::Min(1),
+						])
 						.split(chunks[1]);
 
 					let username_label = format!("Username: {}", form.username);
@@ -604,16 +699,12 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> 
 				Mode::PeersGraph(graph) => {
 					let chunks = Layout::default()
 						.direction(Direction::Vertical)
-						.margin(1)
-						.constraints(
-							[
-								Constraint::Length(3), // title
-								Constraint::Min(5),    // canvas
-								Constraint::Length(1), // status
-							]
-							.as_ref(),
-						)
-						.split(size);
+						.constraints([
+							Constraint::Length(3), // title
+							Constraint::Min(5),    // canvas
+							Constraint::Length(1), // status
+						])
+						.split(main_area);
 
 					let header = Paragraph::new("Peers Graph")
 						.style(Style::default().fg(Color::Blue))
@@ -683,6 +774,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> 
 					f.render_widget(status, chunks[2]);
 				}
 			}
+
+			render_peer_info(f, info_area, &app);
 		})?;
 
 		if event::poll(Duration::from_millis(200))? {
@@ -692,6 +785,22 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> 
 	}
 
 	Ok(())
+}
+
+fn render_peer_info(f: &mut Frame<'_>, area: Rect, app: &ShellApp) {
+	if area.width == 0 || area.height == 0 {
+		return;
+	}
+	let (title, lines) = app.peer_panel_content();
+	let body = if lines.is_empty() {
+		String::from("No peer information available")
+	} else {
+		lines.join("\n")
+	};
+	let panel = Paragraph::new(body)
+		.block(Block::default().borders(Borders::ALL).title(title))
+		.wrap(Wrap { trim: true });
+	f.render_widget(panel, area);
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
