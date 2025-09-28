@@ -1,6 +1,4 @@
 use anyhow::Result;
-use futures::prelude::*;
-use libp2p::core::ConnectedPoint;
 use libp2p::identity::Keypair;
 use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{
@@ -16,7 +14,6 @@ use libp2p::{mdns, ping};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, UdpSocket};
@@ -30,15 +27,14 @@ use uuid::Uuid;
 
 use crate::wait_group::WaitGroupGuard;
 
-const FILE_META_PROTOCOL: &str = "/puppy/filemeta/0.0.1";
-const CONTROL_PROTOCOL: &str = "/puppy/control/0.0.1";
+const PUPPYPEER_PROTOCOL: &str = "/puppypeer/0.0.1";
 const MAX_FILE_CHUNK: u64 = 4 * 1024 * 1024; // 4 MiB per transfer chunk
 const OWNER_ROLE: &str = "owner";
 const VIEWER_ROLE: &str = "viewer";
 const DEFAULT_SESSION_TTL: u64 = 60 * 60; // 1 hour sessions for credential auth
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum FileMetaRequest {
+pub enum PuppyPeerRequest {
 	ListDir {
 		path: String,
 	},
@@ -58,10 +54,40 @@ pub enum FileMetaRequest {
 	ListCpus,
 	ListDisks,
 	ListInterfaces,
+		Authenticate {
+		method: AuthMethod,
+	},
+	CreateUser {
+		username: String,
+		password: String,
+		roles: Vec<String>,
+		permissions: Vec<PermissionGrant>,
+	},
+	CreateToken {
+		username: String,
+		label: Option<String>,
+		expires_in: Option<u64>,
+		permissions: Vec<PermissionGrant>,
+	},
+	GrantAccess {
+		username: String,
+		permissions: Vec<PermissionGrant>,
+		merge: bool,
+	},
+	ListUsers,
+	ListTokens {
+		username: Option<String>,
+	},
+	RevokeToken {
+		token_id: String,
+	},
+	RevokeUser {
+		username: String,
+	}
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum FileMetaResponse {
+pub enum PuppyPeerResponse {
 	DirEntries(Vec<FileEntry>),
 	FileStat(FileEntry),
 	FileChunk(FileChunk),
@@ -69,6 +95,34 @@ pub enum FileMetaResponse {
 	Cpus(Vec<CpuInfo>),
 	Disks(Vec<DiskInfo>),
 	Interfaces(Vec<InterfaceInfo>),
+		AuthSuccess {
+		session: SessionInfo,
+	},
+	AuthFailure {
+		reason: String,
+	},
+	UserCreated {
+		username: String,
+	},
+	UserRemoved {
+		username: String,
+	},
+	TokenIssued {
+		token: String,
+		token_id: String,
+		username: String,
+		permissions: Vec<PermissionGrant>,
+		expires_at: Option<u64>,
+	},
+	TokenRevoked {
+		token_id: String,
+	},
+	AccessGranted {
+		username: String,
+		permissions: Vec<PermissionGrant>,
+	},
+	Users(Vec<UserSummary>),
+	Tokens(Vec<TokenInfo>),
 	Error(String),
 }
 
@@ -130,69 +184,12 @@ struct InterfaceInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlPlaneRequest {
-	Authenticate {
-		method: AuthMethod,
-	},
-	CreateUser {
-		username: String,
-		password: String,
-		roles: Vec<String>,
-		permissions: Vec<PermissionGrant>,
-	},
-	CreateToken {
-		username: String,
-		label: Option<String>,
-		expires_in: Option<u64>,
-		permissions: Vec<PermissionGrant>,
-	},
-	GrantAccess {
-		username: String,
-		permissions: Vec<PermissionGrant>,
-		merge: bool,
-	},
-	ListUsers,
-	ListTokens {
-		username: Option<String>,
-	},
-	RevokeToken {
-		token_id: String,
-	},
-	RevokeUser {
-		username: String,
-	},
+
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlPlaneResponse {
-	AuthSuccess {
-		session: SessionInfo,
-	},
-	AuthFailure {
-		reason: String,
-	},
-	UserCreated {
-		username: String,
-	},
-	UserRemoved {
-		username: String,
-	},
-	TokenIssued {
-		token: String,
-		token_id: String,
-		username: String,
-		permissions: Vec<PermissionGrant>,
-		expires_at: Option<u64>,
-	},
-	TokenRevoked {
-		token_id: String,
-	},
-	AccessGranted {
-		username: String,
-		permissions: Vec<PermissionGrant>,
-	},
-	Users(Vec<UserSummary>),
-	Tokens(Vec<TokenInfo>),
-	Error(String),
+
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,24 +242,20 @@ pub struct TokenInfo {
 	pub issued_by: String,
 }
 
-type FileMetaBehaviour = request_response::json::Behaviour<FileMetaRequest, FileMetaResponse>;
-type ControlBehaviour =
-	request_response::json::Behaviour<ControlPlaneRequest, ControlPlaneResponse>;
+type PuppyPeerBehaviour = request_response::json::Behaviour<PuppyPeerRequest, PuppyPeerResponse>;
 
 #[derive(NetworkBehaviour)]
 #[behaviour(to_swarm = "AgentEvent", event_process = false)]
 pub struct AgentBehaviour {
 	ping: ping::Behaviour,
-	file_meta: FileMetaBehaviour,
-	control_plane: ControlBehaviour,
+	pub puppypeer: PuppyPeerBehaviour,
 	pub mdns: mdns::tokio::Behaviour,
 }
 
 #[derive(Debug)]
 pub enum AgentEvent {
 	Ping(ping::Event),
-	FileMeta(RequestResponseEvent<FileMetaRequest, FileMetaResponse>),
-	Control(RequestResponseEvent<ControlPlaneRequest, ControlPlaneResponse>),
+	PuppyPeer(RequestResponseEvent<PuppyPeerRequest, PuppyPeerResponse>),
 	Mdns(mdns::Event),
 }
 
@@ -272,15 +265,9 @@ impl From<ping::Event> for AgentEvent {
 	}
 }
 
-impl From<RequestResponseEvent<FileMetaRequest, FileMetaResponse>> for AgentEvent {
-	fn from(event: RequestResponseEvent<FileMetaRequest, FileMetaResponse>) -> Self {
-		AgentEvent::FileMeta(event)
-	}
-}
-
-impl From<RequestResponseEvent<ControlPlaneRequest, ControlPlaneResponse>> for AgentEvent {
-	fn from(event: RequestResponseEvent<ControlPlaneRequest, ControlPlaneResponse>) -> Self {
-		AgentEvent::Control(event)
+impl From<RequestResponseEvent<PuppyPeerRequest, PuppyPeerResponse>> for AgentEvent {
+	fn from(event: RequestResponseEvent<PuppyPeerRequest, PuppyPeerResponse>) -> Self {
+		AgentEvent::PuppyPeer(event)
 	}
 }
 
@@ -292,104 +279,14 @@ impl From<mdns::Event> for AgentEvent {
 
 impl AgentBehaviour {
 	fn new(local_peer_id: PeerId) -> Self {
-		let file_protocols = std::iter::once((
-			StreamProtocol::new(FILE_META_PROTOCOL),
-			ProtocolSupport::Full,
-		));
-		let control_protocols =
-			std::iter::once((StreamProtocol::new(CONTROL_PROTOCOL), ProtocolSupport::Full));
-		let file_meta = request_response::json::Behaviour::new(
-			file_protocols,
-			RequestResponseConfig::default(),
-		);
-		let control_plane = request_response::json::Behaviour::new(
-			control_protocols,
-			RequestResponseConfig::default(),
-		);
-		let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)
-			.expect("mDNS init failed");
+		let puppypeer_protocol = std::iter::once((StreamProtocol::new(PUPPYPEER_PROTOCOL), ProtocolSupport::Full));
+		let puppypeer = request_response::json::Behaviour::new(puppypeer_protocol, RequestResponseConfig::default(),);
+		let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id).expect("mDNS init failed");
 		Self {
 			ping: ping::Behaviour::default(),
-			file_meta,
-			control_plane,
+			puppypeer,
 			mdns,
 		}
-	}
-}
-
-fn handle_file_request(req: FileMetaRequest) -> FileMetaResponse {
-	match req {
-		FileMetaRequest::ListDir { path } => match fs::read_dir(&path) {
-			Ok(entries) => {
-				let mut files = Vec::new();
-				for entry in entries.flatten() {
-					let metadata = entry.metadata().ok();
-					let name = entry.file_name().to_string_lossy().to_string();
-					let is_dir = metadata.as_ref().map(|md| md.is_dir()).unwrap_or(false);
-					let size =
-						metadata.and_then(|md| if md.is_dir() { None } else { Some(md.len()) });
-					let extension = entry
-						.path()
-						.extension()
-						.map(|s| s.to_string_lossy().to_string());
-
-					files.push(FileEntry {
-						name,
-						is_dir,
-						extension,
-						size,
-					});
-				}
-				FileMetaResponse::DirEntries(files)
-			}
-			Err(err) => FileMetaResponse::Error(err.to_string()),
-		},
-		FileMetaRequest::StatFile { path } => match fs::metadata(&path) {
-			Ok(metadata) => {
-				let name = Path::new(&path)
-					.file_name()
-					.map(|s| s.to_string_lossy().to_string())
-					.unwrap_or_else(|| path.clone());
-				let is_dir = metadata.is_dir();
-				let size = if is_dir { None } else { Some(metadata.len()) };
-				let extension = Path::new(&path)
-					.extension()
-					.map(|s| s.to_string_lossy().to_string());
-				FileMetaResponse::FileStat(FileEntry {
-					name,
-					is_dir,
-					extension,
-					size,
-				})
-			}
-			Err(err) => FileMetaResponse::Error(err.to_string()),
-		},
-		FileMetaRequest::ReadFile {
-			path,
-			offset,
-			length,
-		} => match read_file_chunk(&path, offset, length) {
-			Ok(chunk) => FileMetaResponse::FileChunk(chunk),
-			Err(err) => FileMetaResponse::Error(err),
-		},
-		FileMetaRequest::WriteFile { path, offset, data } => {
-			match write_file_range(&path, offset, &data) {
-				Ok(ack) => FileMetaResponse::WriteAck(ack),
-				Err(err) => FileMetaResponse::Error(err),
-			}
-		}
-		FileMetaRequest::ListCpus => match collect_cpu_info() {
-			Ok(cpus) => FileMetaResponse::Cpus(cpus),
-			Err(err) => FileMetaResponse::Error(err),
-		},
-		FileMetaRequest::ListDisks => match collect_disk_info() {
-			Ok(disks) => FileMetaResponse::Disks(disks),
-			Err(err) => FileMetaResponse::Error(err),
-		},
-		FileMetaRequest::ListInterfaces => match collect_interface_info() {
-			Ok(interfaces) => FileMetaResponse::Interfaces(interfaces),
-			Err(err) => FileMetaResponse::Error(err),
-		},
 	}
 }
 

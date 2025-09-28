@@ -1,6 +1,6 @@
 use std::{env, path::Path};
 use std::sync::{Arc, Mutex};
-
+use crate::p2p::PuppyPeerRequest;
 use crate::{
 	p2p::{AgentBehaviour, AgentEvent, build_swarm, load_or_generate_keypair},
 	state::{Connection, State},
@@ -39,7 +39,7 @@ impl App {
 		let peer_id = PeerId::from(id_keys.public());
 
 		let mut swarm = build_swarm(id_keys, peer_id).unwrap();
-		let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+		let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
 		swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap()).unwrap();
 		{
@@ -48,13 +48,47 @@ impl App {
 		App { state, swarm, rx }
 	}
 
+	async fn handle_puppy_peer_req(&mut self, req: PuppyPeerRequest) {
+		match req {
+			PuppyPeerRequest::ListDir { path } => {},
+			PuppyPeerRequest::StatFile { path } => {},
+			PuppyPeerRequest::ReadFile { path, offset, length } => {},
+			PuppyPeerRequest::WriteFile { path, offset, data } => {},
+			PuppyPeerRequest::ListCpus => {},
+			PuppyPeerRequest::ListDisks => {},
+			PuppyPeerRequest::ListInterfaces => {},
+			PuppyPeerRequest::Authenticate { method } => {},
+			PuppyPeerRequest::CreateUser { username, password, roles, permissions } => {},
+			PuppyPeerRequest::CreateToken { username, label, expires_in, permissions } => {},
+			PuppyPeerRequest::GrantAccess { username, permissions, merge } => {},
+			PuppyPeerRequest::ListUsers => {},
+			PuppyPeerRequest::ListTokens { username } => {},
+			PuppyPeerRequest::RevokeToken { token_id } => {},
+			PuppyPeerRequest::RevokeUser { username } => {},
+		}
+	}
+
 	async fn handle_agent_event(&mut self, event: AgentEvent) {
 		match event {
 			AgentEvent::Ping(event) => {
 				log::info!("Ping event: {:?}", event);
 			},
-			AgentEvent::FileMeta(_event) => {},
-			AgentEvent::Control(_event) => {},
+			AgentEvent::PuppyPeer(event) => {
+				match event {
+					libp2p::request_response::Event::Message { peer, connection_id, message } => {
+						match message {
+							libp2p::request_response::Message::Request { request_id, request, channel } => {
+								self.handle_puppy_peer_req(request).await;
+								// self.swarm.behaviour_mut().puppypeer.send_response(channel, PuppyPeerResponse::)
+							},
+							libp2p::request_response::Message::Response { request_id, response } => todo!(),
+						}
+					},
+					libp2p::request_response::Event::OutboundFailure { peer, connection_id, request_id, error } => todo!(),
+					libp2p::request_response::Event::InboundFailure { peer, connection_id, request_id, error } => todo!(),
+					libp2p::request_response::Event::ResponseSent { peer, connection_id, request_id } => todo!(),
+				}
+			},
 			AgentEvent::Mdns(event) => match event {
 				mdns::Event::Discovered(items) => {
 					for (peer_id, multiaddr) in items {
@@ -121,14 +155,14 @@ impl App {
 			}
 			SwarmEvent::ExpiredListenAddr { listener_id: _, address: _ } => {}
 			SwarmEvent::ListenerClosed { listener_id: _, addresses: _, reason: _ } => {}
-            SwarmEvent::ListenerError { listener_id: _, error: _ } => {}
-            _ => {}
-        }
+			SwarmEvent::ListenerError { listener_id: _, error: _ } => {}
+			_ => {}
+		}
 	}
 
 	async fn handle_cmd(&mut self, cmd: Command) {
 		match cmd {
-			Command::Connect { peer_id: _, addr } => {
+			Command::Connect { peer_id, addr } => {
 				self.swarm.dial(addr).unwrap();
 			}
 		}
@@ -143,7 +177,7 @@ impl App {
 			cmd = self.rx.recv() => {
 				if let Some(cmd) = cmd {
 					match cmd {
-						Command::Connect { peer_id: _, addr } => {
+						Command::Connect { peer_id, addr } => {
 							self.swarm.dial(addr).unwrap();
 						}
 					}
@@ -181,7 +215,9 @@ impl PuppyPeer {
 		PuppyPeer { shutdown_tx: Some(shutdown_tx), handle, state }
 	}
 
-	pub fn state(&self) -> Arc<Mutex<State>> { self.state.clone() }
+	pub fn state(&self) -> Arc<Mutex<State>> {
+		self.state.clone()
+	}
 
 	/// Wait for the peer until Ctrl+C (SIGINT) then perform a graceful shutdown.
 	pub async fn wait(mut self) {
