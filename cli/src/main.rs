@@ -13,7 +13,6 @@ mod utility;
 
 #[tokio::main]
 async fn main() {
-	simple_logger::init_with_level(log::Level::Info).unwrap();
 	let args = args::Args::parse();
 	let version_label = utility::get_version_label().unwrap_or("dev");
 	log::info!("puppyagent version {}", version_label);
@@ -66,6 +65,7 @@ async fn main() {
 			}
 		},
 		None => {
+			simple_logger::init_with_level(log::Level::Info).unwrap();
 			let peer = PuppyPeer::new();
 			peer.wait().await;
 			return;

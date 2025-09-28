@@ -1,4 +1,5 @@
 use std::io::{self, Stdout};
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
@@ -41,50 +42,13 @@ struct PeerNode {
 }
 
 impl GraphView {
-	fn new() -> Self {
-		let base = sample_peers();
-		let count = base.len().max(1);
-		let peers = base
-			.into_iter()
-			.enumerate()
-			.map(|(i, p)| PeerNode {
-				id: p.id,
-				angle: (i as f64) * (std::f64::consts::TAU / count as f64),
-			})
-			.collect();
-		Self { peers, selected: 0 }
-	}
-	fn next(&mut self) {
-		if self.peers.is_empty() {
-			return;
-		}
-		self.selected = (self.selected + 1) % self.peers.len();
-	}
-	fn previous(&mut self) {
-		if self.peers.is_empty() {
-			return;
-		}
-		if self.selected == 0 {
-			self.selected = self.peers.len() - 1;
-		} else {
-			self.selected -= 1;
-		}
-	}
-	fn refresh(&mut self) {
-		// Placeholder: recompute angles (could reflect dynamic additions)
-		let base_ids: Vec<String> = self.peers.iter().map(|n| n.id.clone()).collect();
-		let count = base_ids.len().max(1);
-		self.peers = base_ids
-			.into_iter()
-			.enumerate()
-			.map(|(i, id)| PeerNode {
-				id,
-				angle: (i as f64) * (std::f64::consts::TAU / count as f64),
-			})
-			.collect();
-		if self.selected >= self.peers.len() {
-			self.selected = 0;
-		}
+	fn new() -> Self { Self { peers: Vec::new(), selected: 0 } }
+	fn next(&mut self) { if !self.peers.is_empty() { self.selected = (self.selected + 1) % self.peers.len(); } }
+	fn previous(&mut self) { if !self.peers.is_empty() { if self.selected == 0 { self.selected = self.peers.len() - 1; } else { self.selected -= 1; } } }
+	fn set_peers(&mut self, peer_ids: &[String]) {
+		let count = peer_ids.len().max(1);
+		self.peers = peer_ids.iter().enumerate().map(|(i, id)| PeerNode { id: id.clone(), angle: (i as f64) * (std::f64::consts::TAU / count as f64) }).collect();
+		if self.selected >= self.peers.len() { self.selected = 0; }
 	}
 }
 
@@ -94,38 +58,10 @@ struct PeersView {
 }
 
 impl PeersView {
-	fn new() -> Self {
-		Self {
-			peers: sample_peers(),
-			selected: 0,
-		}
-	}
-
-	fn next(&mut self) {
-		if self.peers.is_empty() {
-			return;
-		}
-		self.selected = (self.selected + 1) % self.peers.len();
-	}
-
-	fn previous(&mut self) {
-		if self.peers.is_empty() {
-			return;
-		}
-		if self.selected == 0 {
-			self.selected = self.peers.len() - 1;
-		} else {
-			self.selected -= 1;
-		}
-	}
-
-	fn refresh(&mut self) {
-		// Placeholder: refresh logic would query live peer set
-		self.peers = sample_peers();
-		if self.selected >= self.peers.len() {
-			self.selected = 0;
-		}
-	}
+	fn new() -> Self { Self { peers: Vec::new(), selected: 0 } }
+	fn next(&mut self) { if !self.peers.is_empty() { self.selected = (self.selected + 1) % self.peers.len(); } }
+	fn previous(&mut self) { if !self.peers.is_empty() { if self.selected == 0 { self.selected = self.peers.len() - 1; } else { self.selected -= 1; } } }
+	fn set_peers(&mut self, peers: Vec<PeerRow>) { self.peers = peers; if self.selected >= self.peers.len() { self.selected = 0; } }
 }
 
 #[derive(Clone)]
@@ -135,25 +71,7 @@ struct PeerRow {
 	status: String,
 }
 
-fn sample_peers() -> Vec<PeerRow> {
-	vec![
-		PeerRow {
-			id: "12D3KooWAbc...".into(),
-			address: "/ip4/127.0.0.1/tcp/4001".into(),
-			status: "connected".into(),
-		},
-		PeerRow {
-			id: "12D3KooXDef...".into(),
-			address: "/ip4/192.168.1.10/tcp/4001".into(),
-			status: "discovered".into(),
-		},
-		PeerRow {
-			id: "12D3KooYZ12...".into(),
-			address: "/dns4/example.com/tcp/4001".into(),
-			status: "dialing".into(),
-		},
-	]
-}
+// Removed placeholder sample peers; UI now populated from live State.
 
 struct CreateUserForm {
 	username: String,
@@ -185,7 +103,7 @@ struct ShellApp {
 	menu_state: ListState,
 	status_line: String,
 	mode: Mode,
-	_peer: PuppyPeer,
+	peer: PuppyPeer,
 	last_refresh: Instant,
 	refresh_interval: Duration,
 	refresh_count: u64,
@@ -208,7 +126,7 @@ impl ShellApp {
 			menu_state: state,
 			status_line: "Use ↑/↓ to navigate, Enter to select, q to quit".to_string(),
 			mode: Mode::Menu,
-			_peer: PuppyPeer::new(),
+			peer: PuppyPeer::new(),
 			last_refresh: Instant::now(),
 			refresh_interval: Duration::from_secs(5),
 			refresh_count: 0,
@@ -251,9 +169,7 @@ impl ShellApp {
 					"quit" => self.should_quit = true,
 					"peers" => {
 						self.mode = Mode::Peers(PeersView::new());
-						self.status_line =
-							"Peers loaded (placeholder). r: refresh, ↑/↓: navigate, Esc: back"
-								.into();
+						self.status_line = "Peers view. Auto-refresh every 5s. ↑/↓ navigate, Esc back".into();
 					}
 					"create token" => {
 						self.status_line = "Token created (placeholder)".into();
@@ -264,7 +180,7 @@ impl ShellApp {
 					}
 					"peers graph" => {
 						self.mode = Mode::PeersGraph(GraphView::new());
-						self.status_line = "Graph view. r: refresh, ←/→: select, Esc: back".into();
+						self.status_line = "Graph view. Auto-refresh every 5s. ←/→ select, Esc back".into();
 					}
 					_ => {}
 				}
@@ -282,34 +198,28 @@ impl ShellApp {
 					KeyCode::Enter => self.activate(),
 					_ => {}
 				},
-				Mode::Peers(view) => match key.code {
+					Mode::Peers(view) => match key.code {
 					KeyCode::Esc => {
 						self.mode = Mode::Menu;
 						self.status_line = "Back to menu".into();
 					}
 					KeyCode::Down => view.next(),
 					KeyCode::Up => view.previous(),
-					KeyCode::Char('r') => {
-						view.refresh();
-						self.status_line = "Refreshed peers (placeholder)".into();
-					}
+						KeyCode::Char('r') => { /* manual refresh no-op now; auto refresh handles updates */ }
 					KeyCode::Char('q') => {
 						/* allow quit shortcut */
 						self.should_quit = true;
 					}
 					_ => {}
 				},
-				Mode::PeersGraph(graph) => match key.code {
+					Mode::PeersGraph(graph) => match key.code {
 					KeyCode::Esc => {
 						self.mode = Mode::Menu;
 						self.status_line = "Back to menu".into();
 					}
 					KeyCode::Left => graph.previous(),
 					KeyCode::Right => graph.next(),
-					KeyCode::Char('r') => {
-						graph.refresh();
-						self.status_line = "Refreshed graph (placeholder)".into();
-					}
+						KeyCode::Char('r') => { /* manual refresh no-op */ }
 					KeyCode::Char('q') => {
 						self.should_quit = true;
 					}
@@ -359,61 +269,57 @@ impl ShellApp {
 
 	fn periodic_refresh(&mut self) {
 		if self.last_refresh.elapsed() >= self.refresh_interval {
-			// Pull latest core state
-			let state = PuppyPeer::get_state();
-			self.latest_state = Some(state.clone());
-			// Update active views from state (if open)
-			match &mut self.mode {
-				Mode::Peers(view) => {
-					if !state.peers.is_empty() {
-						view.peers = state
-							.peers
-							.iter()
-							.enumerate()
-							.map(|(_i, p)| PeerRow {
-								id: format!("{}", p.id),
-								address: "".into(), // address not yet in State, placeholder
-								status: "".into(),  // could derive from connections later
-							})
-							.collect();
-						if view.selected >= view.peers.len() {
-							view.selected = 0;
-						}
-						self.status_line =
-							format!("Auto-refreshed peers ({} entries)", view.peers.len());
-					} else {
-						view.peers.clear();
-						self.status_line = "Auto-refreshed peers (none)".into();
+			// Pull latest core state (Arc<Mutex<State>>) via instance and take a snapshot clone
+			let state_arc = self.peer.state();
+			let snapshot = state_arc.lock().ok().map(|s| s.clone());
+			if let Some(state) = snapshot.clone() { self.latest_state = Some(state); }
+			// Update active views from snapshot (if open)
+			if let Some(state) = snapshot {
+				let aggregated = Self::aggregate_peers(&state);
+				match &mut self.mode {
+					Mode::Peers(view) => {
+						view.set_peers(aggregated.clone());
+						self.status_line = format!("Auto-refreshed peers ({} entries)", view.peers.len());
 					}
-				}
-				Mode::PeersGraph(graph) => {
-					if !state.peers.is_empty() {
-						let count = state.peers.len();
-						graph.peers = state
-							.peers
-							.iter()
-							.enumerate()
-							.map(|(i, p)| PeerNode {
-								id: format!("{}", p.id),
-								angle: (i as f64) * (std::f64::consts::TAU / count as f64),
-							})
-							.collect();
-						if graph.selected >= graph.peers.len() {
-							graph.selected = 0;
-						}
-						self.status_line =
-							format!("Auto-refreshed graph ({} nodes)", graph.peers.len());
-					} else {
-						graph.peers.clear();
-						self.status_line = "Auto-refreshed graph (none)".into();
+					Mode::PeersGraph(graph) => {
+						let ids: Vec<String> = aggregated.iter().map(|p| p.id.clone()).collect();
+						graph.set_peers(&ids);
+						self.status_line = format!("Auto-refreshed graph ({} nodes)", graph.peers.len());
 					}
+					_ => {}
 				}
-				_ => {}
+			} else {
+				self.status_line = "Auto-refresh failed to lock state".into();
 			}
 			// legacy post-refresh per-mode adjustments removed (state-based updates already applied)
 			self.refresh_count += 1;
 			self.last_refresh = Instant::now();
 		}
+	}
+
+	fn aggregate_peers(state: &State) -> Vec<PeerRow> {
+		// Map peer_id -> (address (first), status)
+		let mut rows: HashMap<String, PeerRow> = HashMap::new();
+		// Discovered peers (addresses)
+		for d in &state.discovered_peers {
+			let id_str = format!("{}", d.peer_id);
+			rows.entry(id_str.clone()).and_modify(|r| {
+				if r.address.is_empty() { r.address = d.multiaddr.to_string(); }
+			}).or_insert(PeerRow { id: id_str, address: d.multiaddr.to_string(), status: "discovered".into() });
+		}
+		// Connections override status
+		for c in &state.connections {
+			let id_str = format!("{}", c.peer_id);
+			rows.entry(id_str.clone()).and_modify(|r| { r.status = "connected".into(); }).or_insert(PeerRow { id: id_str, address: String::new(), status: "connected".into() });
+		}
+		// Explicit peers list (metadata like names) ensure presence
+		for p in &state.peers {
+			let id_str = format!("{}", p.id);
+			rows.entry(id_str.clone()).or_insert(PeerRow { id: id_str, address: String::new(), status: String::new() });
+		}
+		let mut vec: Vec<PeerRow> = rows.into_iter().map(|(_, v)| v).collect();
+		vec.sort_by(|a, b| a.id.cmp(&b.id));
+		vec
 	}
 
 	fn gather_known_addresses(&self, peer_id: &str) -> Vec<String> {
