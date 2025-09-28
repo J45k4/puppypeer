@@ -255,7 +255,7 @@ pub struct AgentBehaviour {
 	ping: ping::Behaviour,
 	file_meta: FileMetaBehaviour,
 	control_plane: ControlBehaviour,
-	mdns: mdns::tokio::Behaviour,
+	pub mdns: mdns::tokio::Behaviour,
 }
 
 #[derive(Debug)]

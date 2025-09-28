@@ -40,26 +40,7 @@ impl App {
 		let mut swarm = build_swarm(id_keys, peer_id).unwrap();
 		let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-		// Listen on all interfaces TCP/8336. Multiaddr requires explicit /tcp/ separator.
-		// Allow overriding the listen address via env:
-		//   PUPPYAGENT_LISTEN=/ip4/0.0.0.0/tcp/9000
-		// or just the port via PUPPYAGENT_PORT=9000
-		let listen_addr: libp2p::Multiaddr = if let Ok(ma) = env::var("PUPPYAGENT_LISTEN") {
-			match ma.parse() {
-				Ok(m) => m,
-				Err(e) => panic!("invalid PUPPYAGENT_LISTEN multiaddr '{ma}': {e}"),
-			}
-		} else {
-			let port: u16 = env::var("PORT")
-				.ok()
-				.and_then(|v| v.parse().ok())
-				.unwrap_or(8336);
-			format!("/ip4/0.0.0.0/tcp/{port}").parse().expect("valid constructed multiaddr")
-		};
-		if let Err(err) = swarm.listen_on(listen_addr.clone()) {
-			panic!("failed to start listener on {listen_addr}: {err}");
-		}
-		log::info!("listening on {listen_addr}");
+		swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap()).unwrap();
 
 		App {
 			state: State::default(),
@@ -70,14 +51,17 @@ impl App {
 
 	async fn handle_agent_event(&mut self, event: AgentEvent) {
 		match event {
-			AgentEvent::Ping(event) => todo!(),
-			AgentEvent::FileMeta(event) => todo!(),
-			AgentEvent::Control(event) => todo!(),
+			AgentEvent::Ping(event) => {
+				log::info!("Ping event: {:?}", event);
+			},
+			AgentEvent::FileMeta(event) => {},
+			AgentEvent::Control(event) => {},
 			AgentEvent::Mdns(event) => match event {
 				mdns::Event::Discovered(items) => {
 					for (peer_id, multiaddr) in items {
 						log::info!("mDNS discovered peer {} at {}", peer_id, multiaddr);
-						self.state.peer_discovered(peer_id, multiaddr);
+						self.state.peer_discovered(peer_id, multiaddr.clone());
+						self.swarm.dial(multiaddr).unwrap();
 					}
 				}
 				mdns::Event::Expired(items) => {
@@ -102,6 +86,7 @@ impl App {
 				concurrent_dial_errors,
 				established_in,
 			} => {
+				log::info!("Connected to peer {}", peer_id);
 				self.state.connections.push(Connection {
 					peer_id,
 					connection_id,
@@ -114,6 +99,7 @@ impl App {
 				num_established,
 				cause,
 			} => {
+				log::info!("Disconnected from peer {}", peer_id);
 				self.state
 					.connections
 					.retain(|c| c.connection_id != connection_id);
