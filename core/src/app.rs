@@ -1,12 +1,17 @@
-use std::{env, path::Path};
-use std::sync::{Arc, Mutex};
-use crate::p2p::PuppyPeerRequest;
+use crate::p2p::{DirEntry, FileChunk, PeerReq, PeerRes, FileWriteAck};
 use crate::{
 	p2p::{AgentBehaviour, AgentEvent, build_swarm, load_or_generate_keypair},
 	state::{Connection, State},
 };
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
+use libp2p::request_response::ResponseChannel;
 use libp2p::{PeerId, Swarm, mdns, swarm::SwarmEvent};
+use std::os::unix::fs::MetadataExt;
+use std::sync::{Arc, Mutex};
+use std::{env, path::Path};
+use tokio::fs;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::{
 	sync::{mpsc::UnboundedReceiver, oneshot},
 	task::JoinHandle,
@@ -39,68 +44,227 @@ impl App {
 		let peer_id = PeerId::from(id_keys.public());
 
 		let mut swarm = build_swarm(id_keys, peer_id).unwrap();
-		let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+		let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-		swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap()).unwrap();
+		swarm
+			.listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
+			.unwrap();
 		{
-			if let Ok(mut s) = state.lock() { s.me = peer_id; }
+			if let Ok(mut s) = state.lock() {
+				s.me = peer_id;
+			}
 		}
 		App { state, swarm, rx }
 	}
 
-	async fn handle_puppy_peer_req(&mut self, req: PuppyPeerRequest) {
-		match req {
-			PuppyPeerRequest::ListDir { path } => {},
-			PuppyPeerRequest::StatFile { path } => {},
-			PuppyPeerRequest::ReadFile { path, offset, length } => {},
-			PuppyPeerRequest::WriteFile { path, offset, data } => {},
-			PuppyPeerRequest::ListCpus => {},
-			PuppyPeerRequest::ListDisks => {},
-			PuppyPeerRequest::ListInterfaces => {},
-			PuppyPeerRequest::Authenticate { method } => {},
-			PuppyPeerRequest::CreateUser { username, password, roles, permissions } => {},
-			PuppyPeerRequest::CreateToken { username, label, expires_in, permissions } => {},
-			PuppyPeerRequest::GrantAccess { username, permissions, merge } => {},
-			PuppyPeerRequest::ListUsers => {},
-			PuppyPeerRequest::ListTokens { username } => {},
-			PuppyPeerRequest::RevokeToken { token_id } => {},
-			PuppyPeerRequest::RevokeUser { username } => {},
-		}
+
+	async fn handle_puppy_peer_req(&mut self, req: PeerReq) -> anyhow::Result<PeerRes> {
+		let res = match req {
+			PeerReq::ListDir { path } => {
+				let mut entries = Vec::new();
+				let mut result = fs::read_dir(path).await?;
+				while let Some(entry) = result.next_entry().await? {
+					let file_type = entry.file_type().await?;
+					let meta = match entry.metadata().await {
+						Ok(m) => m,
+						Err(_) => continue,
+					};
+					let ext = entry
+						.path()
+						.extension()
+						.and_then(|s| s.to_str().map(|s| s.to_string()));
+					entries.push(DirEntry {
+						name: entry.file_name().to_string_lossy().to_string(),
+						is_dir: file_type.is_dir(),
+						extension: ext,
+						size: meta.size(),
+						created_at: meta.created()
+							.ok()
+							.and_then(|t| DateTime::<Utc>::from(t).into()),
+						modified_at: meta
+							.modified()
+							.ok()
+							.and_then(|t| DateTime::<Utc>::from(t).into()),
+						accessed_at: meta
+							.accessed()
+							.ok()
+							.and_then(|t| DateTime::<Utc>::from(t).into()),
+					})
+				}
+				PeerRes::DirEntries(entries)
+			}
+			PeerReq::StatFile { path } => {
+				let path = Path::new(&path);
+				let meta = fs::metadata(path).await?;
+				let file_type = meta.file_type();
+				let ext = path
+					.extension()
+					.and_then(|s| s.to_str().map(|s| s.to_string()));
+				PeerRes::FileStat(DirEntry {
+					name: path
+						.file_name()
+						.and_then(|s| s.to_str().map(|s| s.to_string()))
+						.unwrap_or_default(),
+					is_dir: file_type.is_dir(),
+					extension: ext,
+					size: meta.size(),
+					created_at: meta
+						.created()
+						.ok()
+						.and_then(|t| DateTime::<Utc>::from(t).into()),
+					modified_at: meta
+						.modified()
+						.ok()
+						.and_then(|t| DateTime::<Utc>::from(t).into()),
+					accessed_at: meta
+						.accessed()
+						.ok()
+						.and_then(|t| DateTime::<Utc>::from(t).into()),
+				})
+			}
+			PeerReq::ReadFile {
+				path,
+				offset,
+				length,
+			} => {
+				let file = fs::File::open(&path).await?;
+				let metadata = file.metadata().await?;
+				if metadata.is_dir() {
+					return Ok(PeerRes::Error("Cannot read directory".into()));
+				}
+				let file_len = metadata.len();
+				if offset >= file_len {
+					return Ok(PeerRes::FileChunk(FileChunk {
+						offset,
+						data: Vec::new(),
+						eof: true,
+					}));
+				}
+				let remaining = file_len - offset;
+				let to_read = match length {
+					Some(l) => l.min(remaining),
+					None => remaining,
+				};
+				let mut reader = tokio::io::BufReader::new(file);
+				reader.seek(std::io::SeekFrom::Start(offset)).await?;
+				let mut buffer = vec![0u8; to_read as usize];
+				let n = reader.read(&mut buffer).await?;
+				buffer.truncate(n);
+				let eof = offset + n as u64 >= file_len;
+				PeerRes::FileChunk(FileChunk {
+					offset,
+					data: buffer,
+					eof,
+				})
+			}
+			PeerReq::WriteFile { path, offset, data  } => {
+				// Open (or create) file with write capability
+				let mut file = match fs::OpenOptions::new()
+					.create(true)
+					.write(true)
+					.read(true)
+					.open(&path)
+					.await {
+					Ok(f) => f,
+					Err(e) => return Ok(PeerRes::Error(format!("open failed: {}", e))),
+				};
+				// Ensure we don't overflow length when extending
+				let current_len = match file.metadata().await { Ok(m) => m.len(), Err(e) => return Ok(PeerRes::Error(format!("metadata failed: {}", e))) };
+				let required_len = match offset.checked_add(data.len() as u64) { Some(v) => v, None => return Ok(PeerRes::Error("length overflow".into())) };
+				if required_len > current_len {
+					if let Err(e) = file.set_len(required_len).await { return Ok(PeerRes::Error(format!("set_len failed: {}", e))); }
+				}
+				if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await { return Ok(PeerRes::Error(format!("seek failed: {}", e))); }
+				if let Err(e) = file.write_all(&data).await { return Ok(PeerRes::Error(format!("write failed: {}", e))); }
+				PeerRes::WriteAck(FileWriteAck { bytes_written: data.len() as u64 })
+			},
+			PeerReq::ListCpus => PeerRes::Error("ListCpus not implemented".into()),
+			PeerReq::ListDisks => PeerRes::Error("ListDisks not implemented".into()),
+			PeerReq::ListInterfaces => PeerRes::Error("ListInterfaces not implemented".into()),
+			PeerReq::Authenticate { .. } => PeerRes::Error("Authenticate not implemented".into()),
+			PeerReq::CreateUser { .. } => PeerRes::Error("CreateUser not implemented".into()),
+			PeerReq::CreateToken { .. } => PeerRes::Error("CreateToken not implemented".into()),
+			PeerReq::GrantAccess { .. } => PeerRes::Error("GrantAccess not implemented".into()),
+			PeerReq::ListUsers => PeerRes::Error("ListUsers not implemented".into()),
+			PeerReq::ListTokens { .. } => PeerRes::Error("ListTokens not implemented".into()),
+			PeerReq::RevokeToken { .. } => PeerRes::Error("RevokeToken not implemented".into()),
+			PeerReq::RevokeUser { .. } => PeerRes::Error("RevokeUser not implemented".into()),
+		};
+		Ok(res)
 	}
 
 	async fn handle_agent_event(&mut self, event: AgentEvent) {
 		match event {
 			AgentEvent::Ping(event) => {
 				log::info!("Ping event: {:?}", event);
-			},
+			}
 			AgentEvent::PuppyPeer(event) => {
 				match event {
-					libp2p::request_response::Event::Message { peer, connection_id, message } => {
+					libp2p::request_response::Event::Message {
+						peer: _,
+						connection_id: _,
+						message,
+					} => {
 						match message {
-							libp2p::request_response::Message::Request { request_id, request, channel } => {
-								self.handle_puppy_peer_req(request).await;
+							libp2p::request_response::Message::Request {
+								request_id: _,
+								request,
+								channel,
+							} => {
+								if let Ok(res) = self.handle_puppy_peer_req(request).await {
+										let _ = self.swarm
+											.behaviour_mut()
+											.puppypeer
+											.send_response(channel, res);
+								} else {
+										let _ = self.swarm.behaviour_mut().puppypeer.send_response(
+											channel,
+											PeerRes::Error("Internal error".into()),
+										);
+								}
 								// self.swarm.behaviour_mut().puppypeer.send_response(channel, PuppyPeerResponse::)
-							},
-							libp2p::request_response::Message::Response { request_id, response } => todo!(),
+							}
+							libp2p::request_response::Message::Response {
+								request_id: _,
+								response: _,
+							} => todo!(),
 						}
-					},
-					libp2p::request_response::Event::OutboundFailure { peer, connection_id, request_id, error } => todo!(),
-					libp2p::request_response::Event::InboundFailure { peer, connection_id, request_id, error } => todo!(),
-					libp2p::request_response::Event::ResponseSent { peer, connection_id, request_id } => todo!(),
+					}
+					libp2p::request_response::Event::OutboundFailure {
+						peer: _,
+						connection_id: _,
+						request_id: _,
+						error: _,
+					} => todo!(),
+					libp2p::request_response::Event::InboundFailure {
+						peer: _,
+						connection_id: _,
+						request_id: _,
+						error: _,
+					} => todo!(),
+					libp2p::request_response::Event::ResponseSent {
+						peer: _,
+						connection_id: _,
+						request_id: _,
+					} => todo!(),
 				}
-			},
+			}
 			AgentEvent::Mdns(event) => match event {
 				mdns::Event::Discovered(items) => {
 					for (peer_id, multiaddr) in items {
 						log::info!("mDNS discovered peer {} at {}", peer_id, multiaddr);
-						if let Ok(mut state) = self.state.lock() { state.peer_discovered(peer_id, multiaddr.clone()); }
+						if let Ok(mut state) = self.state.lock() {
+							state.peer_discovered(peer_id, multiaddr.clone());
+						}
 						self.swarm.dial(multiaddr).unwrap();
 					}
 				}
 				mdns::Event::Expired(items) => {
 					for (peer_id, multiaddr) in items {
 						log::info!("mDNS expired peer {} at {}", peer_id, multiaddr);
-						if let Ok(mut state) = self.state.lock() { state.peer_expired(peer_id, multiaddr); }
+						if let Ok(mut state) = self.state.lock() {
+							state.peer_expired(peer_id, multiaddr);
+						}
 					}
 				}
 			},
@@ -120,7 +284,12 @@ impl App {
 				established_in: _,
 			} => {
 				log::info!("Connected to peer {}", peer_id);
-				if let Ok(mut state) = self.state.lock() { state.connections.push(Connection { peer_id, connection_id }); }
+				if let Ok(mut state) = self.state.lock() {
+					state.connections.push(Connection {
+						peer_id,
+						connection_id,
+					});
+				}
 			}
 			SwarmEvent::ConnectionClosed {
 				peer_id,
@@ -130,9 +299,17 @@ impl App {
 				cause: _,
 			} => {
 				log::info!("Disconnected from peer {}", peer_id);
-				if let Ok(mut state) = self.state.lock() { state.connections.retain(|c| c.connection_id != connection_id); }
+				if let Ok(mut state) = self.state.lock() {
+					state
+						.connections
+						.retain(|c| c.connection_id != connection_id);
+				}
 			}
-			SwarmEvent::IncomingConnection { connection_id: _, local_addr: _, send_back_addr: _ } => {}
+			SwarmEvent::IncomingConnection {
+				connection_id: _,
+				local_addr: _,
+				send_back_addr: _,
+			} => {}
 			SwarmEvent::IncomingConnectionError {
 				connection_id: _,
 				local_addr: _,
@@ -145,24 +322,43 @@ impl App {
 				peer_id: _,
 				error: _,
 			} => {}
-			SwarmEvent::Dialing { peer_id: _, connection_id: _ } => {}
+			SwarmEvent::Dialing {
+				peer_id: _,
+				connection_id: _,
+			} => {}
 			SwarmEvent::NewExternalAddrCandidate { address: _ } => {}
 			SwarmEvent::ExternalAddrConfirmed { address: _ } => {}
 			SwarmEvent::ExternalAddrExpired { address: _ } => {}
-			SwarmEvent::NewExternalAddrOfPeer { peer_id: _, address: _ } => {}
-			SwarmEvent::NewListenAddr { listener_id: _, address } => {
+			SwarmEvent::NewExternalAddrOfPeer {
+				peer_id: _,
+				address: _,
+			} => {}
+			SwarmEvent::NewListenAddr {
+				listener_id: _,
+				address,
+			} => {
 				log::info!("listener address added: {:?}", address);
 			}
-			SwarmEvent::ExpiredListenAddr { listener_id: _, address: _ } => {}
-			SwarmEvent::ListenerClosed { listener_id: _, addresses: _, reason: _ } => {}
-			SwarmEvent::ListenerError { listener_id: _, error: _ } => {}
+			SwarmEvent::ExpiredListenAddr {
+				listener_id: _,
+				address: _,
+			} => {}
+			SwarmEvent::ListenerClosed {
+				listener_id: _,
+				addresses: _,
+				reason: _,
+			} => {}
+			SwarmEvent::ListenerError {
+				listener_id: _,
+				error: _,
+			} => {}
 			_ => {}
 		}
 	}
 
 	async fn handle_cmd(&mut self, cmd: Command) {
 		match cmd {
-			Command::Connect { peer_id, addr } => {
+			Command::Connect { peer_id: _, addr } => {
 				self.swarm.dial(addr).unwrap();
 			}
 		}
@@ -177,7 +373,7 @@ impl App {
 			cmd = self.rx.recv() => {
 				if let Some(cmd) = cmd {
 					match cmd {
-						Command::Connect { peer_id, addr } => {
+						Command::Connect { peer_id: _, addr } => {
 							self.swarm.dial(addr).unwrap();
 						}
 					}
@@ -212,7 +408,11 @@ impl PuppyPeer {
 			}
 		});
 
-		PuppyPeer { shutdown_tx: Some(shutdown_tx), handle, state }
+		PuppyPeer {
+			shutdown_tx: Some(shutdown_tx),
+			handle,
+			state,
+		}
 	}
 
 	pub fn state(&self) -> Arc<Mutex<State>> {

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use libp2p::identity::Keypair;
 use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{
@@ -34,7 +35,7 @@ const VIEWER_ROLE: &str = "viewer";
 const DEFAULT_SESSION_TTL: u64 = 60 * 60; // 1 hour sessions for credential auth
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum PuppyPeerRequest {
+pub enum PeerReq {
 	ListDir {
 		path: String,
 	},
@@ -54,7 +55,7 @@ pub enum PuppyPeerRequest {
 	ListCpus,
 	ListDisks,
 	ListInterfaces,
-		Authenticate {
+	Authenticate {
 		method: AuthMethod,
 	},
 	CreateUser {
@@ -83,19 +84,19 @@ pub enum PuppyPeerRequest {
 	},
 	RevokeUser {
 		username: String,
-	}
+	},
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum PuppyPeerResponse {
-	DirEntries(Vec<FileEntry>),
-	FileStat(FileEntry),
+pub enum PeerRes {
+	DirEntries(Vec<DirEntry>),
+	FileStat(DirEntry),
 	FileChunk(FileChunk),
 	WriteAck(FileWriteAck),
 	Cpus(Vec<CpuInfo>),
 	Disks(Vec<DiskInfo>),
 	Interfaces(Vec<InterfaceInfo>),
-		AuthSuccess {
+	AuthSuccess {
 		session: SessionInfo,
 	},
 	AuthFailure {
@@ -127,23 +128,26 @@ pub enum PuppyPeerResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct FileEntry {
-	name: String,
-	is_dir: bool,
-	extension: Option<String>,
-	size: Option<u64>,
+pub struct DirEntry {
+	pub name: String,
+	pub is_dir: bool,
+	pub extension: Option<String>,
+	pub size: u64,
+	pub created_at: Option<DateTime<Utc>>,
+	pub modified_at: Option<DateTime<Utc>>,
+	pub accessed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct FileChunk {
-	offset: u64,
-	data: Vec<u8>,
-	eof: bool,
+pub struct FileChunk {
+	pub offset: u64,
+	pub data: Vec<u8>,
+	pub eof: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct FileWriteAck {
-	bytes_written: u64,
+pub struct FileWriteAck {
+	pub bytes_written: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,16 +184,6 @@ struct InterfaceInfo {
 	errors_on_received: u64,
 	errors_on_transmitted: u64,
 	mtu: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ControlPlaneRequest {
-
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ControlPlaneResponse {
-
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,7 +236,7 @@ pub struct TokenInfo {
 	pub issued_by: String,
 }
 
-type PuppyPeerBehaviour = request_response::json::Behaviour<PuppyPeerRequest, PuppyPeerResponse>;
+type PuppyPeerBehaviour = request_response::json::Behaviour<PeerReq, PeerRes>;
 
 #[derive(NetworkBehaviour)]
 #[behaviour(to_swarm = "AgentEvent", event_process = false)]
@@ -255,7 +249,7 @@ pub struct AgentBehaviour {
 #[derive(Debug)]
 pub enum AgentEvent {
 	Ping(ping::Event),
-	PuppyPeer(RequestResponseEvent<PuppyPeerRequest, PuppyPeerResponse>),
+	PuppyPeer(RequestResponseEvent<PeerReq, PeerRes>),
 	Mdns(mdns::Event),
 }
 
@@ -265,8 +259,8 @@ impl From<ping::Event> for AgentEvent {
 	}
 }
 
-impl From<RequestResponseEvent<PuppyPeerRequest, PuppyPeerResponse>> for AgentEvent {
-	fn from(event: RequestResponseEvent<PuppyPeerRequest, PuppyPeerResponse>) -> Self {
+impl From<RequestResponseEvent<PeerReq, PeerRes>> for AgentEvent {
+	fn from(event: RequestResponseEvent<PeerReq, PeerRes>) -> Self {
 		AgentEvent::PuppyPeer(event)
 	}
 }
@@ -279,9 +273,16 @@ impl From<mdns::Event> for AgentEvent {
 
 impl AgentBehaviour {
 	fn new(local_peer_id: PeerId) -> Self {
-		let puppypeer_protocol = std::iter::once((StreamProtocol::new(PUPPYPEER_PROTOCOL), ProtocolSupport::Full));
-		let puppypeer = request_response::json::Behaviour::new(puppypeer_protocol, RequestResponseConfig::default(),);
-		let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id).expect("mDNS init failed");
+		let puppypeer_protocol = std::iter::once((
+			StreamProtocol::new(PUPPYPEER_PROTOCOL),
+			ProtocolSupport::Full,
+		));
+		let puppypeer = request_response::json::Behaviour::new(
+			puppypeer_protocol,
+			RequestResponseConfig::default(),
+		);
+		let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)
+			.expect("mDNS init failed");
 		Self {
 			ping: ping::Behaviour::default(),
 			puppypeer,
@@ -420,29 +421,6 @@ struct UserRecord {
 }
 
 #[derive(Debug, Clone)]
-struct TokenRecord {
-	id: String,
-	secret: String,
-	username: String,
-	label: Option<String>,
-	permissions: HashSet<PermissionGrant>,
-	issued_at: u64,
-	expires_at: Option<u64>,
-	revoked: bool,
-	issued_by: String,
-}
-
-#[derive(Debug, Clone)]
-struct SessionRecord {
-	session_id: String,
-	username: String,
-	roles: HashSet<String>,
-	permissions: HashSet<PermissionGrant>,
-	expires_at: Option<u64>,
-	token_id: Option<String>,
-}
-
-#[derive(Debug, Clone)]
 enum Capability {
 	FileRead(String),
 	FileWrite(String),
@@ -475,28 +453,6 @@ impl PermissionGrant {
 			PermissionGrant::SystemInfo => matches!(capability, Capability::System),
 			PermissionGrant::DiskInfo => matches!(capability, Capability::Disks),
 			PermissionGrant::NetworkInfo => matches!(capability, Capability::Network),
-		}
-	}
-}
-
-impl SessionRecord {
-	fn is_expired(&self, now: u64) -> bool {
-		self.expires_at.map(|exp| exp <= now).unwrap_or(false)
-	}
-
-	fn allows(&self, capability: &Capability) -> bool {
-		self.permissions.iter().any(|perm| perm.allows(capability))
-	}
-
-	fn to_info(&self) -> SessionInfo {
-		let mut roles: Vec<String> = self.roles.iter().cloned().collect();
-		roles.sort();
-		SessionInfo {
-			session_id: self.session_id.clone(),
-			username: self.username.clone(),
-			roles,
-			permissions: self.permissions.iter().cloned().collect(),
-			expires_at: self.expires_at,
 		}
 	}
 }
