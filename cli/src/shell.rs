@@ -1,5 +1,7 @@
+use anyhow::Result;
 use std::collections::HashMap;
 use std::io::{self, Stdout};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
@@ -9,7 +11,7 @@ use crossterm::{
 	terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use libp2p::PeerId;
-use puppyagent_core::{PuppyPeer, State};
+use puppyagent_core::{PuppyPeer, State, p2p::DirEntry};
 use ratatui::{
 	Frame, Terminal,
 	backend::CrosstermBackend,
@@ -26,6 +28,8 @@ const LOCAL_LISTEN_MULTIADDR: &str = "/ip4/0.0.0.0:8336";
 enum Mode {
 	Menu,
 	Peers(PeersView),
+	PeerActions(PeerActionsState),
+	FileBrowser(FileBrowserView),
 	CreateUser(CreateUserForm),
 	PeersGraph(GraphView),
 }
@@ -112,6 +116,12 @@ impl PeersView {
 	}
 }
 
+impl Default for PeersView {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
 #[derive(Clone)]
 struct PeerRow {
 	id: String,
@@ -120,6 +130,120 @@ struct PeerRow {
 }
 
 // Removed placeholder sample peers; UI now populated from live State.
+
+struct PeerActionsState {
+	view: PeersView,
+	menu: PeerActionsMenu,
+}
+
+impl PeerActionsState {
+	fn new(view: PeersView, peer: PeerRow) -> Self {
+		Self {
+			menu: PeerActionsMenu::new(peer),
+			view,
+		}
+	}
+
+	fn take_view(&mut self) -> PeersView {
+		std::mem::take(&mut self.view)
+	}
+
+	fn ensure_selected_peer(&mut self) {
+		if let Some(peer) = self.view.peers.get(self.view.selected).cloned() {
+			self.menu.update_peer(peer);
+		}
+	}
+}
+
+struct PeerActionsMenu {
+	peer: PeerRow,
+	items: Vec<&'static str>,
+	selected: usize,
+}
+
+impl PeerActionsMenu {
+	fn new(peer: PeerRow) -> Self {
+		Self {
+			peer,
+			items: vec!["file browser", "back"],
+			selected: 0,
+		}
+	}
+
+	fn next(&mut self) {
+		if self.items.is_empty() {
+			return;
+		}
+		self.selected = if self.selected + 1 < self.items.len() {
+			self.selected + 1
+		} else {
+			0
+		};
+	}
+
+	fn previous(&mut self) {
+		if self.items.is_empty() {
+			return;
+		}
+		self.selected = if self.selected == 0 {
+			self.items.len().saturating_sub(1)
+		} else {
+			self.selected - 1
+		};
+	}
+
+	fn selected_item(&self) -> Option<&'static str> {
+		self.items.get(self.selected).copied()
+	}
+
+	fn update_peer(&mut self, peer: PeerRow) {
+		self.peer = peer;
+	}
+}
+
+struct FileBrowserView {
+	peer_id: String,
+	path: String,
+	entries: Vec<DirEntry>,
+	selected: usize,
+}
+
+impl FileBrowserView {
+	fn new(peer_id: String, path: String, entries: Vec<DirEntry>) -> Self {
+		Self {
+			peer_id,
+			path,
+			entries,
+			selected: 0,
+		}
+	}
+
+	fn next(&mut self) {
+		if self.entries.is_empty() {
+			return;
+		}
+		self.selected = if self.selected + 1 < self.entries.len() {
+			self.selected + 1
+		} else {
+			0
+		};
+	}
+
+	fn previous(&mut self) {
+		if self.entries.is_empty() {
+			return;
+		}
+		self.selected = if self.selected == 0 {
+			self.entries.len().saturating_sub(1)
+		} else {
+			self.selected - 1
+		};
+	}
+
+	fn selected_entry(&self) -> Option<&DirEntry> {
+		self.entries.get(self.selected)
+	}
+}
 
 struct CreateUserForm {
 	username: String,
@@ -240,6 +364,8 @@ impl ShellApp {
 
 	fn handle_event(&mut self, event: Event) {
 		if let Event::Key(key) = event {
+			let mut next_mode: Option<Mode> = None;
+			let mut pending_peer_actions: Option<String> = None;
 			match &mut self.mode {
 				Mode::Menu => match key.code {
 					KeyCode::Char('q') => self.should_quit = true,
@@ -255,10 +381,109 @@ impl ShellApp {
 					}
 					KeyCode::Down => view.next(),
 					KeyCode::Up => view.previous(),
-					KeyCode::Char('r') => { /* manual refresh no-op now; auto refresh handles updates */
+					KeyCode::Enter => {
+						if let Some(peer) = view.peers.get(view.selected).cloned() {
+							let snapshot = std::mem::take(view);
+							self.status_line = format!(
+								"Peer actions for {}. ↑/↓ navigate, Enter select, Esc back",
+								peer.id
+							);
+							next_mode =
+								Some(Mode::PeerActions(PeerActionsState::new(snapshot, peer)));
+						}
+					}
+					KeyCode::Char('r') => {}
+					KeyCode::Char('q') => {
+						self.should_quit = true;
+					}
+					_ => {}
+				},
+				Mode::PeerActions(state) => match key.code {
+					KeyCode::Esc => {
+						let peer_id = state.menu.peer.id.clone();
+						self.status_line = format!("Returning from actions for {}", peer_id);
+						next_mode = Some(Mode::Peers(state.take_view()));
+					}
+					KeyCode::Down => state.menu.next(),
+					KeyCode::Up => state.menu.previous(),
+					KeyCode::Enter => match state.menu.selected_item() {
+						Some("file browser") => {
+							let peer_id = state.menu.peer.id.clone();
+							match self.create_file_browser_view(peer_id.clone(), "/") {
+								Ok(view) => {
+									self.status_line = format!("Browsing / on {}", peer_id);
+									next_mode = Some(Mode::FileBrowser(view));
+								}
+								Err(err) => {
+									self.status_line =
+										format!("Failed to list root directory: {}", err);
+								}
+							}
+						}
+						Some("back") => {
+							let peer_id = state.menu.peer.id.clone();
+							self.status_line = format!("Returning from actions for {}", peer_id);
+							next_mode = Some(Mode::Peers(state.take_view()));
+						}
+						_ => {}
+					},
+					KeyCode::Char('q') => {
+						self.should_quit = true;
+					}
+					KeyCode::Char('r') => {}
+					_ => {}
+				},
+				Mode::FileBrowser(view) => match key.code {
+					KeyCode::Esc => {
+						pending_peer_actions = Some(view.peer_id.clone());
+					}
+					KeyCode::Down => view.next(),
+					KeyCode::Up => view.previous(),
+					KeyCode::Enter => {
+						if let Some(entry) = view.selected_entry().cloned() {
+							if entry.is_dir {
+								let peer_id = view.peer_id.clone();
+								let target = join_child_path(&view.path, &entry.name);
+								match self.create_file_browser_view(peer_id, &target) {
+									Ok(mut next_view) => {
+										next_view.selected = 0;
+										self.status_line =
+											format!("Browsing {} on {}", target, next_view.peer_id);
+										next_mode = Some(Mode::FileBrowser(next_view));
+									}
+									Err(err) => {
+										self.status_line =
+											format!("Failed to open {}: {}", target, err);
+									}
+								}
+							} else {
+								self.status_line = format!(
+									"Selected file {} ({}). Enter directories to navigate",
+									entry.name,
+									format_size(entry.size)
+								);
+							}
+						}
+					}
+					KeyCode::Backspace | KeyCode::Left => {
+						let parent = parent_path(&view.path);
+						if parent != view.path {
+							let peer_id = view.peer_id.clone();
+							match self.create_file_browser_view(peer_id, &parent) {
+								Ok(mut next_view) => {
+									next_view.selected = 0;
+									self.status_line =
+										format!("Browsing {} on {}", parent, next_view.peer_id);
+									next_mode = Some(Mode::FileBrowser(next_view));
+								}
+								Err(err) => {
+									self.status_line =
+										format!("Failed to open {}: {}", parent, err);
+								}
+							}
+						}
 					}
 					KeyCode::Char('q') => {
-						/* allow quit shortcut */
 						self.should_quit = true;
 					}
 					_ => {}
@@ -270,52 +495,84 @@ impl ShellApp {
 					}
 					KeyCode::Left => graph.previous(),
 					KeyCode::Right => graph.next(),
-					KeyCode::Char('r') => { /* manual refresh no-op */ }
+					KeyCode::Char('r') => {}
 					KeyCode::Char('q') => {
 						self.should_quit = true;
 					}
 					_ => {}
 				},
-				Mode::CreateUser(form) => {
-					match key.code {
-						KeyCode::Esc => {
-							self.mode = Mode::Menu;
-							self.status_line = "Cancelled create user".into();
-						}
-						KeyCode::Tab | KeyCode::BackTab => {
-							form.field = match form.field {
-								ActiveField::Username => ActiveField::Password,
-								ActiveField::Password => ActiveField::Username,
-							};
-						}
-						KeyCode::Enter => {
-							if !form.username.is_empty() && !form.password.is_empty() {
-								form.submitted = true;
-								self.status_line =
-									format!("Created user '{}' (placeholder)", form.username);
-								self.mode = Mode::Menu;
-							} else {
-								self.status_line = "Both fields required".into();
-							}
-						}
-						KeyCode::Char(c) => match form.field {
-							ActiveField::Username => form.username.push(c),
-							ActiveField::Password => form.password.push(c),
-						},
-						KeyCode::Backspace => match form.field {
-							ActiveField::Username => {
-								form.username.pop();
-							}
-							ActiveField::Password => {
-								form.password.pop();
-							}
-						},
-						KeyCode::Left | KeyCode::Right => {} // ignore for now
-						_ => {}
+				Mode::CreateUser(form) => match key.code {
+					KeyCode::Esc => {
+						self.mode = Mode::Menu;
+						self.status_line = "Cancelled create user".into();
 					}
+					KeyCode::Tab | KeyCode::BackTab => {
+						form.field = match form.field {
+							ActiveField::Username => ActiveField::Password,
+							ActiveField::Password => ActiveField::Username,
+						};
+					}
+					KeyCode::Enter => {
+						if !form.username.is_empty() && !form.password.is_empty() {
+							form.submitted = true;
+							self.status_line =
+								format!("Created user '{}' (placeholder)", form.username);
+							self.mode = Mode::Menu;
+						} else {
+							self.status_line = "Both fields required".into();
+						}
+					}
+					KeyCode::Char(c) => match form.field {
+						ActiveField::Username => form.username.push(c),
+						ActiveField::Password => form.password.push(c),
+					},
+					KeyCode::Backspace => match form.field {
+						ActiveField::Username => {
+							form.username.pop();
+						}
+						ActiveField::Password => {
+							form.password.pop();
+						}
+					},
+					KeyCode::Left | KeyCode::Right => {}
+					_ => {}
+				},
+			}
+			if let Some(mode) = next_mode {
+				self.mode = mode;
+			}
+			if let Some(peer_id) = pending_peer_actions {
+				if let Some((state, status)) = self.peer_actions_state_for(&peer_id) {
+					self.status_line = status;
+					self.mode = Mode::PeerActions(state);
+				} else {
+					self.status_line = format!("Peer {} not available", peer_id);
+					self.mode = Mode::Menu;
 				}
 			}
 		}
+	}
+
+	fn create_file_browser_view(&self, peer_id: String, path: &str) -> Result<FileBrowserView> {
+		let entries = self.peer.list_dir_blocking(path)?;
+		Ok(FileBrowserView::new(peer_id, path.to_string(), entries))
+	}
+
+	fn peer_actions_state_for(&self, peer_id: &str) -> Option<(PeerActionsState, String)> {
+		let state = self.latest_state.as_ref()?;
+		let aggregated = Self::aggregate_peers(state);
+		let mut view = PeersView::new();
+		view.set_peers(aggregated.clone());
+		if view.peers.is_empty() {
+			return None;
+		}
+		if let Some(idx) = view.peers.iter().position(|p| p.id == peer_id) {
+			view.selected = idx;
+		}
+		let selected = view.peers.get(view.selected)?.clone();
+		let mut actions = PeerActionsState::new(view, selected.clone());
+		actions.ensure_selected_peer();
+		Some((actions, format!("Peer actions for {}", selected.id)))
 	}
 
 	fn periodic_refresh(&mut self) {
@@ -334,6 +591,26 @@ impl ShellApp {
 						view.set_peers(aggregated.clone());
 						self.status_line =
 							format!("Auto-refreshed peers ({} entries)", view.peers.len());
+					}
+					Mode::PeerActions(state) => {
+						state.view.set_peers(aggregated.clone());
+						if let Some(idx) = state
+							.view
+							.peers
+							.iter()
+							.position(|p| p.id == state.menu.peer.id)
+						{
+							state.view.selected = idx;
+						} else if !state.view.peers.is_empty() {
+							if state.view.selected >= state.view.peers.len() {
+								state.view.selected = state.view.peers.len() - 1;
+							}
+						}
+						state.ensure_selected_peer();
+						self.status_line = format!(
+							"Auto-refreshed peer actions ({} peers)",
+							state.view.peers.len()
+						);
 					}
 					Mode::PeersGraph(graph) => {
 						let ids: Vec<String> = aggregated.iter().map(|p| p.id.clone()).collect();
@@ -445,6 +722,59 @@ impl ShellApp {
 				}
 				("Selected Peer".into(), lines)
 			}
+			Mode::PeerActions(state) => {
+				let peer = &state.menu.peer;
+				let mut lines = Vec::new();
+				lines.push(format!("Peer ID: {}", peer.id));
+				let mut addresses = Vec::new();
+				if !peer.address.is_empty() {
+					addresses.push(peer.address.clone());
+				}
+				for addr in self.gather_known_addresses(&peer.id) {
+					if !addresses.contains(&addr) {
+						addresses.push(addr);
+					}
+				}
+				match addresses.len() {
+					0 => lines.push("Dial Address: unknown".into()),
+					1 => lines.push(format!("Dial Address: {}", addresses[0])),
+					_ => {
+						lines.push("Dial Addresses:".into());
+						for (idx, addr) in addresses.iter().enumerate() {
+							lines.push(format!("{}: {}", idx + 1, addr));
+						}
+					}
+				}
+				if !peer.status.is_empty() {
+					lines.push(format!("Status: {}", peer.status));
+				}
+				("Peer Actions".into(), lines)
+			}
+			Mode::FileBrowser(view) => {
+				let mut lines = Vec::new();
+				lines.push(format!("Peer: {}", view.peer_id));
+				lines.push(format!("Path: {}", view.path));
+				if let Some(entry) = view.selected_entry() {
+					lines.push(format!("Name: {}", entry.name));
+					lines.push(format!(
+						"Type: {}",
+						if entry.is_dir { "directory" } else { "file" }
+					));
+					if let Some(ext) = &entry.extension {
+						lines.push(format!("Extension: {}", ext));
+					}
+					lines.push(format!("Size: {}", format_size(entry.size)));
+					if let Some(modified) = entry.modified_at {
+						lines.push(format!("Modified: {}", modified.to_rfc3339()));
+					}
+					if let Some(accessed) = entry.accessed_at {
+						lines.push(format!("Accessed: {}", accessed.to_rfc3339()));
+					}
+				} else {
+					lines.push("Directory is empty".into());
+				}
+				("File Browser".into(), lines)
+			}
 			Mode::PeersGraph(graph) if !graph.peers.is_empty() => {
 				let node = &graph.peers[graph.selected];
 				let mut lines = Vec::new();
@@ -544,6 +874,124 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> 
 						)
 						.highlight_symbol("▶ ");
 					f.render_stateful_widget(list, chunks[1], &mut app.menu_state);
+
+					let status = Paragraph::new(app.status_line.as_str())
+						.block(Block::default().borders(Borders::ALL).title("Status"));
+					f.render_widget(status, chunks[2]);
+				}
+				Mode::PeerActions(state) => {
+					let chunks = Layout::default()
+						.direction(Direction::Vertical)
+						.constraints([
+							Constraint::Length(3), // title
+							Constraint::Min(5),    // actions list
+							Constraint::Length(1), // status
+						])
+						.split(main_area);
+
+					let title = format!("Actions for {}", state.menu.peer.id);
+					let header = Paragraph::new(title)
+						.style(Style::default().fg(Color::Green))
+						.block(Block::default().borders(Borders::ALL).title("Header"));
+					f.render_widget(header, chunks[0]);
+
+					let items: Vec<ListItem> = state
+						.menu
+						.items
+						.iter()
+						.enumerate()
+						.map(|(idx, item)| {
+							let style = if idx == state.menu.selected {
+								Style::default()
+									.fg(Color::Cyan)
+									.add_modifier(Modifier::BOLD)
+							} else {
+								Style::default()
+							};
+							let prefix = if idx == state.menu.selected {
+								"▶ "
+							} else {
+								"  "
+							};
+							ListItem::new(format!("{}{}", prefix, item)).style(style)
+						})
+						.collect();
+
+					let list = List::new(items).block(
+						Block::default()
+							.borders(Borders::ALL)
+							.title("Peer Actions (Enter select, Esc back)"),
+					);
+					f.render_widget(list, chunks[1]);
+
+					let status = Paragraph::new(app.status_line.as_str())
+						.block(Block::default().borders(Borders::ALL).title("Status"));
+					f.render_widget(status, chunks[2]);
+				}
+				Mode::FileBrowser(view) => {
+					use ratatui::widgets::{Row, Table};
+					let chunks = Layout::default()
+						.direction(Direction::Vertical)
+						.constraints([
+							Constraint::Length(3), // title
+							Constraint::Min(5),    // table
+							Constraint::Length(1), // status
+						])
+						.split(main_area);
+
+					let header = Paragraph::new(format!("File Browser — {}", view.path))
+						.style(Style::default().fg(Color::Blue))
+						.block(
+							Block::default()
+								.borders(Borders::ALL)
+								.title(format!("Peer: {}", view.peer_id)),
+						);
+					f.render_widget(header, chunks[0]);
+
+					let header_row = Row::new(vec!["Idx", "Name", "Type", "Size"])
+						.style(Style::default().add_modifier(Modifier::BOLD));
+					let rows: Vec<Row> = view
+						.entries
+						.iter()
+						.enumerate()
+						.map(|(idx, entry)| {
+							let style = if idx == view.selected {
+								Style::default().fg(Color::Cyan)
+							} else {
+								Style::default()
+							};
+							let display_name = if entry.is_dir {
+								format!("{}/", entry.name)
+							} else {
+								entry.name.clone()
+							};
+							let entry_type = if entry.is_dir { "dir" } else { "file" };
+							Row::new(vec![
+								format!("{}", idx),
+								display_name,
+								entry_type.into(),
+								format_size(entry.size),
+							])
+							.style(style)
+						})
+						.collect();
+
+					let widths = [
+						Constraint::Length(4),
+						Constraint::Percentage(60),
+						Constraint::Length(6),
+						Constraint::Length(12),
+					];
+
+					let table = Table::new(rows, &widths)
+						.header(header_row)
+						.block(
+							Block::default()
+								.borders(Borders::ALL)
+								.title("Files (Enter=open, Backspace=up, Esc=back)"),
+						)
+						.highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+					f.render_widget(table, chunks[1]);
 
 					let status = Paragraph::new(app.status_line.as_str())
 						.block(Block::default().borders(Borders::ALL).title("Status"));
@@ -782,6 +1230,46 @@ fn render_peer_info(f: &mut Frame<'_>, area: Rect, app: &ShellApp) {
 		.block(Block::default().borders(Borders::ALL).title(title))
 		.wrap(Wrap { trim: true });
 	f.render_widget(panel, area);
+}
+
+fn join_child_path(base: &str, child: &str) -> String {
+	if base == "/" {
+		format!("/{}", child)
+	} else {
+		Path::new(base).join(child).to_string_lossy().to_string()
+	}
+}
+
+fn parent_path(path: &str) -> String {
+	if path == "/" {
+		return "/".into();
+	}
+	let mut buf = PathBuf::from(path);
+	if buf.pop() {
+		let parent = buf.to_string_lossy().to_string();
+		if parent.is_empty() {
+			"/".into()
+		} else {
+			parent
+		}
+	} else {
+		"/".into()
+	}
+}
+
+fn format_size(size: u64) -> String {
+	const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+	let mut value = size as f64;
+	let mut unit_index = 0;
+	while value >= 1024.0 && unit_index < UNITS.len() - 1 {
+		value /= 1024.0;
+		unit_index += 1;
+	}
+	if unit_index == 0 {
+		format!("{} {}", size, UNITS[unit_index])
+	} else {
+		format!("{:.1} {}", value, UNITS[unit_index])
+	}
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
