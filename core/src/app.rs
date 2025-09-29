@@ -8,8 +8,8 @@ use crate::{
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use libp2p::request_response::ResponseChannel;
 use libp2p::{PeerId, Swarm, mdns, swarm::SwarmEvent};
+use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt;
 use std::sync::{Arc, Mutex};
 use std::{env, path::Path};
@@ -24,6 +24,8 @@ use tokio::{
 	task::{self, JoinHandle},
 };
 
+use libp2p::request_response::OutboundRequestId;
+
 pub enum Command {
 	Connect {
 		peer_id: libp2p::PeerId,
@@ -33,12 +35,18 @@ pub enum Command {
 		path: String,
 		tx: oneshot::Sender<Result<Vec<DirEntry>>>,
 	},
+	FetchDir {
+		peer: libp2p::PeerId,
+		path: String,
+		tx: oneshot::Sender<Result<Vec<DirEntry>>>,
+	},
 }
 
 pub struct App {
 	state: Arc<Mutex<State>>,
 	swarm: Swarm<AgentBehaviour>,
 	rx: UnboundedReceiver<Command>,
+	pending_dir_requests: HashMap<OutboundRequestId, oneshot::Sender<Result<Vec<DirEntry>>>>,
 }
 
 impl App {
@@ -65,10 +73,19 @@ impl App {
 				s.me = peer_id;
 			}
 		}
-		(App { state, swarm, rx }, tx)
+		(
+			App {
+				state,
+				swarm,
+				rx,
+				pending_dir_requests: HashMap::new(),
+			},
+			tx,
+		)
 	}
 
 	async fn handle_puppy_peer_req(&mut self, req: PeerReq) -> anyhow::Result<PeerRes> {
+		log::info!("Received PeerReq: {:?}", req);
 		let res = match req {
 			PeerReq::ListDir { path } => {
 				let entries = Self::collect_dir_entries(&path).await?;
@@ -325,28 +342,46 @@ impl App {
 								// self.swarm.behaviour_mut().puppypeer.send_response(channel, PuppyPeerResponse::)
 							}
 							libp2p::request_response::Message::Response {
-								request_id: _,
-								response: _,
-							} => todo!(),
+								request_id,
+								response,
+							} => {
+								if let Some(tx) = self.pending_dir_requests.remove(&request_id) {
+									let result = match response {
+										PeerRes::DirEntries(entries) => Ok(entries),
+										PeerRes::Error(err) => Err(anyhow!(err)),
+										other => Err(anyhow!("unexpected response: {:?}", other)),
+									};
+									let _ = tx.send(result);
+								}
+							}
 						}
 					}
 					libp2p::request_response::Event::OutboundFailure {
-						peer: _,
+						peer,
 						connection_id: _,
-						request_id: _,
-						error: _,
-					} => todo!(),
+						request_id,
+						error,
+					} => {
+						log::warn!("outbound request to {} failed: {error}", peer);
+						if let Some(tx) = self.pending_dir_requests.remove(&request_id) {
+							let _ = tx.send(Err(anyhow!("request failed: {error}")));
+						}
+					}
 					libp2p::request_response::Event::InboundFailure {
-						peer: _,
+						peer,
 						connection_id: _,
 						request_id: _,
-						error: _,
-					} => todo!(),
+						error,
+					} => {
+						log::warn!("inbound failure from {}: {error}", peer);
+					}
 					libp2p::request_response::Event::ResponseSent {
-						peer: _,
+						peer,
 						connection_id: _,
 						request_id: _,
-					} => todo!(),
+					} => {
+						log::debug!("response sent to {}", peer);
+					}
 				}
 			}
 			AgentEvent::Mdns(event) => match event {
@@ -469,6 +504,16 @@ impl App {
 					log::warn!("ListDir response receiver dropped for path {path}");
 				}
 			}
+			Command::FetchDir { peer, path, tx } => {
+				let request_id = self
+					.swarm
+					.behaviour_mut()
+					.puppypeer
+					.send_request(&peer, PeerReq::ListDir { path: path.clone() });
+				if let Some(prev) = self.pending_dir_requests.insert(request_id, tx) {
+					let _ = prev.send(Err(anyhow!("request superseded")));
+				}
+			}
 		}
 	}
 
@@ -548,6 +593,40 @@ impl PuppyPeer {
 					.map_err(|e| anyhow!("failed to send ListDir command: {e}"))?;
 				rx.await
 					.map_err(|e| anyhow!("ListDir response channel closed: {e}"))?
+			})
+		})
+	}
+
+	pub async fn list_dir_remote(
+		&self,
+		peer: libp2p::PeerId,
+		path: impl Into<String>,
+	) -> Result<Vec<DirEntry>> {
+		let path = path.into();
+		let (tx, rx) = oneshot::channel();
+		self.cmd_tx
+			.send(Command::FetchDir { peer, path, tx })
+			.map_err(|e| anyhow!("failed to send FetchDir command: {e}"))?;
+		rx.await
+			.map_err(|e| anyhow!("FetchDir response channel closed: {e}"))?
+	}
+
+	pub fn list_dir_remote_blocking(
+		&self,
+		peer: libp2p::PeerId,
+		path: impl Into<String>,
+	) -> Result<Vec<DirEntry>> {
+		let sender = self.cmd_tx.clone();
+		let path = path.into();
+		let handle = tokio::runtime::Handle::current();
+		task::block_in_place(move || {
+			handle.block_on(async move {
+				let (tx, rx) = oneshot::channel();
+				sender
+					.send(Command::FetchDir { peer, path, tx })
+					.map_err(|e| anyhow!("failed to send FetchDir command: {e}"))?;
+				rx.await
+					.map_err(|e| anyhow!("FetchDir response channel closed: {e}"))?
 			})
 		})
 	}

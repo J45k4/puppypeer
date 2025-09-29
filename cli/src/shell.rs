@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
@@ -282,6 +282,14 @@ impl FileBrowserView {
 			self.scroll = max_scroll;
 		}
 	}
+
+	fn replace_entries(&mut self, path: String, entries: Vec<DirEntry>) {
+		self.path = path;
+		self.entries = entries;
+		self.selected = 0;
+		self.scroll = 0;
+		self.clamp_scroll();
+	}
 }
 
 struct CreateUserForm {
@@ -483,12 +491,11 @@ impl ShellApp {
 							if entry.is_dir {
 								let peer_id = view.peer_id.clone();
 								let target = join_child_path(&view.path, &entry.name);
-								match self.create_file_browser_view(peer_id, &target) {
-									Ok(mut next_view) => {
-										next_view.selected = 0;
+								match Self::fetch_dir_entries(&self.peer, &peer_id, &target) {
+									Ok(entries) => {
+										view.replace_entries(target.clone(), entries);
 										self.status_line =
-											format!("Browsing {} on {}", target, next_view.peer_id);
-										next_mode = Some(Mode::FileBrowser(next_view));
+											format!("Browsing {} on {}", target, peer_id);
 									}
 									Err(err) => {
 										self.status_line =
@@ -508,12 +515,11 @@ impl ShellApp {
 						let parent = parent_path(&view.path);
 						if parent != view.path {
 							let peer_id = view.peer_id.clone();
-							match self.create_file_browser_view(peer_id, &parent) {
-								Ok(mut next_view) => {
-									next_view.selected = 0;
+							match Self::fetch_dir_entries(&self.peer, &peer_id, &parent) {
+								Ok(entries) => {
+									view.replace_entries(parent.clone(), entries);
 									self.status_line =
-										format!("Browsing {} on {}", parent, next_view.peer_id);
-									next_mode = Some(Mode::FileBrowser(next_view));
+										format!("Browsing {} on {}", parent, peer_id);
 								}
 								Err(err) => {
 									self.status_line =
@@ -592,11 +598,6 @@ impl ShellApp {
 		}
 	}
 
-	fn create_file_browser_view(&self, peer_id: String, path: &str) -> Result<FileBrowserView> {
-		let entries = self.peer.list_dir_blocking(path)?;
-		Ok(FileBrowserView::new(peer_id, path.to_string(), entries))
-	}
-
 	fn peer_actions_state_for(&self, peer_id: &str) -> Option<(PeerActionsState, String)> {
 		let state = self.latest_state.as_ref()?;
 		let aggregated = Self::aggregate_peers(state);
@@ -612,6 +613,18 @@ impl ShellApp {
 		let mut actions = PeerActionsState::new(view, selected.clone());
 		actions.ensure_selected_peer();
 		Some((actions, format!("Peer actions for {}", selected.id)))
+	}
+
+	fn create_file_browser_view(&self, peer_id: String, path: &str) -> Result<FileBrowserView> {
+		let entries = Self::fetch_dir_entries(&self.peer, &peer_id, path)?;
+		Ok(FileBrowserView::new(peer_id, path.to_string(), entries))
+	}
+
+	fn fetch_dir_entries(peer: &PuppyPeer, peer_id: &str, path: &str) -> Result<Vec<DirEntry>> {
+		let target =
+			PeerId::from_str(peer_id).with_context(|| format!("invalid peer id {peer_id}"))?;
+		peer.list_dir_remote_blocking(target, path.to_string())
+			.with_context(|| format!("listing {} on {}", path, peer_id))
 	}
 
 	fn render(&mut self, f: &mut Frame<'_>) {
