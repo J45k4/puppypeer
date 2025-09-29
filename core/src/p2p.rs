@@ -151,10 +151,10 @@ pub struct FileWriteAck {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct CpuInfo {
-	name: String,
-	usage: f32,
-	frequency_hz: u64,
+pub struct CpuInfo {
+	pub name: String,
+	pub usage: f32,
+	pub frequency_hz: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,17 +173,17 @@ struct DiskInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct InterfaceInfo {
-	name: String,
-	mac: String,
-	ips: Vec<String>,
-	total_received: u64,
-	total_transmitted: u64,
-	packets_received: u64,
-	packets_transmitted: u64,
-	errors_on_received: u64,
-	errors_on_transmitted: u64,
-	mtu: u64,
+pub struct InterfaceInfo {
+	pub name: String,
+	pub mac: String,
+	pub ips: Vec<String>,
+	pub total_received: u64,
+	pub total_transmitted: u64,
+	pub packets_received: u64,
+	pub packets_transmitted: u64,
+	pub errors_on_received: u64,
+	pub errors_on_transmitted: u64,
+	pub mtu: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,21 +342,6 @@ fn write_file_range(path: &str, offset: u64, data: &[u8]) -> Result<FileWriteAck
 	})
 }
 
-fn collect_cpu_info() -> Result<Vec<CpuInfo>, String> {
-	let mut system = System::new_all();
-	system.refresh_cpu_usage();
-	let cpus = system
-		.cpus()
-		.iter()
-		.map(|cpu| CpuInfo {
-			name: cpu.name().to_string(),
-			usage: cpu.cpu_usage(),
-			frequency_hz: cpu.frequency(),
-		})
-		.collect();
-	Ok(cpus)
-}
-
 fn collect_disk_info() -> Result<Vec<DiskInfo>, String> {
 	let disks = Disks::new_with_refreshed_list();
 	let infos = disks
@@ -385,26 +370,6 @@ fn collect_disk_info() -> Result<Vec<DiskInfo>, String> {
 				removable: disk.is_removable(),
 				kind: format!("{:?}", disk.kind()),
 			}
-		})
-		.collect();
-	Ok(infos)
-}
-
-fn collect_interface_info() -> Result<Vec<InterfaceInfo>, String> {
-	let networks = Networks::new_with_refreshed_list();
-	let infos = networks
-		.iter()
-		.map(|(name, data)| InterfaceInfo {
-			name: name.clone(),
-			mac: data.mac_address().to_string(),
-			ips: data.ip_networks().iter().map(|ip| ip.to_string()).collect(),
-			total_received: data.total_received(),
-			total_transmitted: data.total_transmitted(),
-			packets_received: data.total_packets_received(),
-			packets_transmitted: data.total_packets_transmitted(),
-			errors_on_received: data.total_errors_on_received(),
-			errors_on_transmitted: data.total_errors_on_transmitted(),
-			mtu: data.mtu(),
 		})
 		.collect();
 	Ok(infos)

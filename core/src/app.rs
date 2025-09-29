@@ -1,4 +1,4 @@
-use crate::p2p::{DirEntry, FileChunk, PeerReq, PeerRes, FileWriteAck};
+use crate::p2p::{AuthMethod, CpuInfo, DirEntry, FileChunk, FileWriteAck, InterfaceInfo, PeerReq, PeerRes};
 use crate::{
 	p2p::{AgentBehaviour, AgentEvent, build_swarm, load_or_generate_keypair},
 	state::{Connection, State},
@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use libp2p::request_response::ResponseChannel;
 use libp2p::{PeerId, Swarm, mdns, swarm::SwarmEvent};
+use sysinfo::{Networks, System};
 use std::os::unix::fs::MetadataExt;
 use std::sync::{Arc, Mutex};
 use std::{env, path::Path};
@@ -178,12 +179,64 @@ impl App {
 				if let Err(e) = file.write_all(&data).await { return Ok(PeerRes::Error(format!("write failed: {}", e))); }
 				PeerRes::WriteAck(FileWriteAck { bytes_written: data.len() as u64 })
 			},
-			PeerReq::ListCpus => PeerRes::Error("ListCpus not implemented".into()),
+			PeerReq::ListCpus => {
+				let mut system = System::new_all();
+				system.refresh_cpu_usage();
+				let cpus = system
+					.cpus()
+					.iter()
+					.map(|cpu| CpuInfo {
+						name: cpu.name().to_string(),
+						usage: cpu.cpu_usage(),
+						frequency_hz: cpu.frequency(),
+					})
+					.collect();
+				PeerRes::Cpus(cpus)
+			},
 			PeerReq::ListDisks => PeerRes::Error("ListDisks not implemented".into()),
-			PeerReq::ListInterfaces => PeerRes::Error("ListInterfaces not implemented".into()),
-			PeerReq::Authenticate { .. } => PeerRes::Error("Authenticate not implemented".into()),
-			PeerReq::CreateUser { .. } => PeerRes::Error("CreateUser not implemented".into()),
-			PeerReq::CreateToken { .. } => PeerRes::Error("CreateToken not implemented".into()),
+			PeerReq::ListInterfaces => {
+				let networks = Networks::new_with_refreshed_list();
+				let infos = networks
+					.iter()
+					.map(|(name, data)| InterfaceInfo {
+						name: name.clone(),
+						mac: data.mac_address().to_string(),
+						ips: data.ip_networks().iter().map(|ip| ip.to_string()).collect(),
+						total_received: data.total_received(),
+						total_transmitted: data.total_transmitted(),
+						packets_received: data.total_packets_received(),
+						packets_transmitted: data.total_packets_transmitted(),
+						errors_on_received: data.total_errors_on_received(),
+						errors_on_transmitted: data.total_errors_on_transmitted(),
+						mtu: data.mtu(),
+					})
+					.collect();
+				PeerRes::Interfaces(infos)
+			},
+			PeerReq::Authenticate { method  } => {
+				match method {
+					AuthMethod::Token { token } => todo!(),
+					AuthMethod::Credentials { username, password } => todo!(),
+				}
+			},
+			PeerReq::CreateUser { username, password, roles, permissions  } => {
+				let mut state = self.state.lock().unwrap();
+				state.create_user(username.clone(), password)?;
+				PeerRes::UserCreated { username }
+			},
+			PeerReq::CreateToken { username, label, expires_in, permissions } => {
+				let mut state = self.state.lock().unwrap();
+				if !state.users.iter().any(|u| u.name == username) {
+					return Ok(PeerRes::Error("User does not exist".into()));
+				}
+				PeerRes::TokenIssued {
+					token: "".into(),
+					token_id: "".into(),
+					username: username.clone(),
+					permissions: Vec::new(),
+					expires_at: None,
+				}
+			},
 			PeerReq::GrantAccess { .. } => PeerRes::Error("GrantAccess not implemented".into()),
 			PeerReq::ListUsers => PeerRes::Error("ListUsers not implemented".into()),
 			PeerReq::ListTokens { .. } => PeerRes::Error("ListTokens not implemented".into()),

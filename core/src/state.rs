@@ -1,3 +1,4 @@
+use anyhow::bail;
 use libp2p::{Multiaddr, PeerId, swarm::ConnectionId};
 
 pub const FLAG_READ: u8 = 0x01;
@@ -84,6 +85,12 @@ pub struct Peer {
 }
 
 #[derive(Clone, Debug)]
+pub struct User {
+    pub name: String,
+    pub passw: String, 
+}
+
+#[derive(Clone, Debug)]
 pub struct State {
 	pub me: PeerId,
 	pub relationships: Vec<Relationship>,
@@ -91,6 +98,7 @@ pub struct State {
 	pub connections: Vec<Connection>,
 	pub discovered_peers: Vec<DiscoveredPeer>,
 	pub peers: Vec<Peer>,
+    pub users: Vec<User>,
 }
 
 impl Default for State {
@@ -102,6 +110,7 @@ impl Default for State {
 			connections: Vec::new(),
 			discovered_peers: Vec::new(),
 			peers: Vec::new(),
+            users: Vec::new(),
 		}
 	}
 }
@@ -150,4 +159,12 @@ impl State {
 		self.discovered_peers
 			.retain(|p| !(p.peer_id == peer_id && p.multiaddr == multiaddr));
 	}
+
+    pub fn create_user(&mut self, username: String, password: String) -> anyhow::Result<()> {
+        if self.users.iter().any(|u| u.name == username) {
+            bail!("User already exists");
+        }
+        self.users.push(User { name: username, passw: password });
+        Ok(())
+    }
 }
