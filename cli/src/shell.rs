@@ -206,6 +206,8 @@ struct FileBrowserView {
 	path: String,
 	entries: Vec<DirEntry>,
 	selected: usize,
+	scroll: usize,
+	viewport: usize,
 }
 
 impl FileBrowserView {
@@ -215,6 +217,8 @@ impl FileBrowserView {
 			path,
 			entries,
 			selected: 0,
+			scroll: 0,
+			viewport: 1,
 		}
 	}
 
@@ -225,8 +229,10 @@ impl FileBrowserView {
 		self.selected = if self.selected + 1 < self.entries.len() {
 			self.selected + 1
 		} else {
+			self.scroll = 0;
 			0
 		};
+		self.clamp_scroll();
 	}
 
 	fn previous(&mut self) {
@@ -234,14 +240,47 @@ impl FileBrowserView {
 			return;
 		}
 		self.selected = if self.selected == 0 {
-			self.entries.len().saturating_sub(1)
+			let last = self.entries.len().saturating_sub(1);
+			self.scroll = self.entries.len().saturating_sub(self.viewport);
+			last
 		} else {
 			self.selected - 1
 		};
+		self.clamp_scroll();
 	}
 
 	fn selected_entry(&self) -> Option<&DirEntry> {
 		self.entries.get(self.selected)
+	}
+
+	fn set_viewport(&mut self, viewport: usize) {
+		self.viewport = viewport.max(1);
+		self.clamp_scroll();
+	}
+
+	fn clamp_scroll(&mut self) {
+		if self.entries.is_empty() {
+			self.selected = 0;
+			self.scroll = 0;
+			return;
+		}
+		if self.selected >= self.entries.len() {
+			self.selected = self.entries.len().saturating_sub(1);
+		}
+		let window = self.viewport.min(self.entries.len());
+		if window == 0 {
+			self.scroll = 0;
+			return;
+		}
+		let max_scroll = self.entries.len().saturating_sub(window);
+		if self.selected < self.scroll {
+			self.scroll = self.selected;
+		} else if self.selected >= self.scroll + window {
+			self.scroll = self.selected + 1 - window;
+		}
+		if self.scroll > max_scroll {
+			self.scroll = max_scroll;
+		}
 	}
 }
 
@@ -575,6 +614,378 @@ impl ShellApp {
 		Some((actions, format!("Peer actions for {}", selected.id)))
 	}
 
+	fn render(&mut self, f: &mut Frame<'_>) {
+		let size = f.size();
+		let columns = Layout::default()
+			.direction(Direction::Horizontal)
+			.margin(1)
+			.constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+			.split(size);
+		let main_area = columns[0];
+		let info_area = columns[1];
+
+		match &mut self.mode {
+			Mode::Menu => {
+				let chunks = Layout::default()
+					.direction(Direction::Vertical)
+					.constraints([
+						Constraint::Length(3), // title / help
+						Constraint::Min(5),    // menu list
+						Constraint::Length(1), // status line
+					])
+					.split(main_area);
+
+				let header = Paragraph::new("PuppyPeer")
+					.style(Style::default().fg(Color::Yellow))
+					.block(Block::default().borders(Borders::ALL).title("Header"));
+				f.render_widget(header, chunks[0]);
+
+				let items: Vec<ListItem> =
+					self.menu_items.iter().map(|m| ListItem::new(*m)).collect();
+				let list = List::new(items)
+					.block(Block::default().borders(Borders::ALL).title("Menu"))
+					.highlight_style(
+						Style::default()
+							.fg(Color::Cyan)
+							.add_modifier(Modifier::BOLD | Modifier::REVERSED),
+					)
+					.highlight_symbol("▶ ");
+				f.render_stateful_widget(list, chunks[1], &mut self.menu_state);
+
+				let status = Paragraph::new(self.status_line.as_str())
+					.block(Block::default().borders(Borders::ALL).title("Status"));
+				f.render_widget(status, chunks[2]);
+			}
+			Mode::PeerActions(state) => {
+				let chunks = Layout::default()
+					.direction(Direction::Vertical)
+					.constraints([
+						Constraint::Length(3), // title
+						Constraint::Min(5),    // actions list
+						Constraint::Length(1), // status
+					])
+					.split(main_area);
+
+				let title = format!("Actions for {}", state.menu.peer.id);
+				let header = Paragraph::new(title)
+					.style(Style::default().fg(Color::Green))
+					.block(Block::default().borders(Borders::ALL).title("Header"));
+				f.render_widget(header, chunks[0]);
+
+				let items: Vec<ListItem> = state
+					.menu
+					.items
+					.iter()
+					.enumerate()
+					.map(|(idx, item)| {
+						let style = if idx == state.menu.selected {
+							Style::default()
+								.fg(Color::Cyan)
+								.add_modifier(Modifier::BOLD)
+						} else {
+							Style::default()
+						};
+						let prefix = if idx == state.menu.selected {
+							"▶ "
+						} else {
+							"  "
+						};
+						ListItem::new(format!("{}{}", prefix, item)).style(style)
+					})
+					.collect();
+
+				let list = List::new(items).block(
+					Block::default()
+						.borders(Borders::ALL)
+						.title("Peer Actions (Enter select, Esc back)"),
+				);
+				f.render_widget(list, chunks[1]);
+
+				let status = Paragraph::new(self.status_line.as_str())
+					.block(Block::default().borders(Borders::ALL).title("Status"));
+				f.render_widget(status, chunks[2]);
+			}
+			Mode::FileBrowser(view) => {
+				use ratatui::widgets::{Row, Table};
+				let chunks = Layout::default()
+					.direction(Direction::Vertical)
+					.constraints([
+						Constraint::Length(3), // title
+						Constraint::Min(5),    // table
+						Constraint::Length(1), // status
+					])
+					.split(main_area);
+
+				let header = Paragraph::new(format!("File Browser — {}", view.path))
+					.style(Style::default().fg(Color::Blue))
+					.block(
+						Block::default()
+							.borders(Borders::ALL)
+							.title(format!("Peer: {}", view.peer_id)),
+					);
+				f.render_widget(header, chunks[0]);
+
+				let viewport = if chunks[1].height > 1 {
+					(chunks[1].height - 1) as usize
+				} else {
+					1
+				};
+				view.set_viewport(viewport);
+
+				let header_row = Row::new(vec!["Idx", "Name", "Type", "Size"])
+					.style(Style::default().add_modifier(Modifier::BOLD));
+				let rows: Vec<Row> = view
+					.entries
+					.iter()
+					.enumerate()
+					.skip(view.scroll)
+					.take(view.viewport)
+					.map(|(idx, entry)| {
+						let style = if idx == view.selected {
+							Style::default().fg(Color::Cyan)
+						} else {
+							Style::default()
+						};
+						let display_name = if entry.is_dir {
+							format!("{}/", entry.name)
+						} else {
+							entry.name.clone()
+						};
+						let entry_type = if entry.is_dir { "dir" } else { "file" };
+						Row::new(vec![
+							format!("{}", idx),
+							display_name,
+							entry_type.into(),
+							format_size(entry.size),
+						])
+						.style(style)
+					})
+					.collect();
+
+				let widths = [
+					Constraint::Length(4),
+					Constraint::Percentage(60),
+					Constraint::Length(6),
+					Constraint::Length(12),
+				];
+
+				let table = Table::new(rows, &widths)
+					.header(header_row)
+					.block(
+						Block::default()
+							.borders(Borders::ALL)
+							.title("Files (Enter=open, Backspace=up, Esc=back)"),
+					)
+					.highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+				f.render_widget(table, chunks[1]);
+
+				let status = Paragraph::new(self.status_line.as_str())
+					.block(Block::default().borders(Borders::ALL).title("Status"));
+				f.render_widget(status, chunks[2]);
+			}
+			Mode::Peers(view) => {
+				use ratatui::widgets::{Row, Table};
+				let chunks = Layout::default()
+					.direction(Direction::Vertical)
+					.constraints([
+						Constraint::Length(3), // title
+						Constraint::Min(5),    // table
+						Constraint::Length(1), // status
+					])
+					.split(main_area);
+
+				let header = Paragraph::new("Peers")
+					.style(Style::default().fg(Color::Green))
+					.block(Block::default().borders(Borders::ALL).title("Header"));
+				f.render_widget(header, chunks[0]);
+
+				let header_row = Row::new(vec!["Idx", "Peer ID", "Address", "Status"])
+					.style(Style::default().add_modifier(Modifier::BOLD));
+				let rows: Vec<Row> = view
+					.peers
+					.iter()
+					.enumerate()
+					.map(|(i, p)| {
+						let style = if i == view.selected {
+							Style::default().fg(Color::Cyan)
+						} else {
+							Style::default()
+						};
+						Row::new(vec![
+							format!("{}", i),
+							p.id.clone(),
+							p.address.clone(),
+							p.status.clone(),
+						])
+						.style(style)
+					})
+					.collect();
+
+				let widths = [
+					Constraint::Length(4),
+					Constraint::Length(16),
+					Constraint::Percentage(50),
+					Constraint::Length(12),
+				];
+				let table = Table::new(rows, &widths)
+					.header(header_row)
+					.block(
+						Block::default()
+							.borders(Borders::ALL)
+							.title("Peers (r=refresh, Esc=back)"),
+					)
+					.highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+				f.render_widget(table, chunks[1]);
+
+				let status = Paragraph::new(self.status_line.as_str())
+					.block(Block::default().borders(Borders::ALL).title("Status"));
+				f.render_widget(status, chunks[2]);
+			}
+			Mode::CreateUser(form) => {
+				let chunks = Layout::default()
+					.direction(Direction::Vertical)
+					.constraints([
+						Constraint::Length(3), // title
+						Constraint::Min(5),    // form
+						Constraint::Length(1), // status
+					])
+					.split(main_area);
+
+				let header = Paragraph::new("Create User")
+					.style(Style::default().fg(Color::Magenta))
+					.block(Block::default().borders(Borders::ALL).title("Header"));
+				f.render_widget(header, chunks[0]);
+
+				let form_chunks = Layout::default()
+					.direction(Direction::Vertical)
+					.margin(1)
+					.constraints([
+						Constraint::Length(3),
+						Constraint::Length(3),
+						Constraint::Min(1),
+					])
+					.split(chunks[1]);
+
+				let username_label = format!("Username: {}", form.username);
+				let password_mask: String = "*".repeat(form.password.len());
+				let password_label = format!("Password: {}", password_mask);
+
+				let username_title = match form.field {
+					ActiveField::Username => "[Username]*",
+					ActiveField::Password => "Username",
+				};
+				let password_title = match form.field {
+					ActiveField::Password => "[Password]*",
+					ActiveField::Username => "Password",
+				};
+
+				let username_style = if form.field == ActiveField::Username {
+					Style::default().fg(Color::Cyan)
+				} else {
+					Style::default()
+				};
+				let password_style = if form.field == ActiveField::Password {
+					Style::default().fg(Color::Cyan)
+				} else {
+					Style::default()
+				};
+
+				let username_para = Paragraph::new(username_label)
+					.style(username_style)
+					.block(Block::default().borders(Borders::ALL).title(username_title))
+					.wrap(Wrap { trim: true });
+
+				let password_para = Paragraph::new(password_label)
+					.style(password_style)
+					.block(Block::default().borders(Borders::ALL).title(password_title))
+					.wrap(Wrap { trim: true });
+
+				let help = Paragraph::new("Tab: switch field | Enter: submit | Esc: cancel")
+					.block(Block::default().borders(Borders::ALL).title("Help"));
+
+				f.render_widget(username_para, form_chunks[0]);
+				f.render_widget(password_para, form_chunks[1]);
+				f.render_widget(help, form_chunks[2]);
+
+				let status = Paragraph::new(self.status_line.as_str())
+					.block(Block::default().borders(Borders::ALL).title("Status"));
+				f.render_widget(status, chunks[2]);
+			}
+			Mode::PeersGraph(graph) => {
+				let chunks = Layout::default()
+					.direction(Direction::Vertical)
+					.constraints([
+						Constraint::Length(3), // title
+						Constraint::Min(5),    // canvas
+						Constraint::Length(1), // status
+					])
+					.split(main_area);
+
+				let header = Paragraph::new("Peers Graph")
+					.style(Style::default().fg(Color::Blue))
+					.block(Block::default().borders(Borders::ALL).title("Header"));
+				f.render_widget(header, chunks[0]);
+
+				let peers_clone = graph
+					.peers
+					.iter()
+					.enumerate()
+					.map(|(i, n)| (i, n.id.clone(), n.angle))
+					.collect::<Vec<_>>();
+				let selected = graph.selected;
+				let canvas = Canvas::default()
+					.block(
+						Block::default()
+							.borders(Borders::ALL)
+							.title("Graph (r=refresh, ←/→ select, Esc back)"),
+					)
+					.x_bounds([-1.3, 1.3])
+					.y_bounds([-1.1, 1.1])
+					.paint(move |ctx| {
+						for (i1, _id1, a1) in &peers_clone {
+							let x1 = a1.cos();
+							let y1 = a1.sin();
+							for (i2, _id2, a2) in &peers_clone {
+								if i1 < i2 {
+									let x2 = a2.cos();
+									let y2 = a2.sin();
+									ctx.draw(&Line {
+										x1,
+										y1,
+										x2,
+										y2,
+										color: Color::DarkGray,
+									});
+								}
+							}
+						}
+						for (i, id, a) in &peers_clone {
+							let x = a.cos();
+							let y = a.sin();
+							let color = if *i == selected {
+								Color::Cyan
+							} else {
+								Color::White
+							};
+							ctx.draw(&Points {
+								coords: &[(x, y)],
+								color,
+							});
+							let label: String = id.chars().take(5).collect();
+							ctx.print(x * 1.1, y * 1.1, label);
+						}
+					});
+				f.render_widget(canvas, chunks[1]);
+
+				let status = Paragraph::new(self.status_line.as_str())
+					.block(Block::default().borders(Borders::ALL).title("Status"));
+				f.render_widget(status, chunks[2]);
+			}
+		}
+
+		render_peer_info(f, info_area, self);
+	}
+
 	fn periodic_refresh(&mut self) {
 		if self.last_refresh.elapsed() >= self.refresh_interval {
 			// Pull latest core state (Arc<Mutex<State>>) via instance and take a snapshot clone
@@ -835,377 +1246,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> 
 	let mut app = ShellApp::new();
 
 	while !app.should_quit {
-		// Periodic refresh hook
 		app.periodic_refresh();
-		terminal.draw(|f| {
-			let size = f.size();
-			let columns = Layout::default()
-				.direction(Direction::Horizontal)
-				.margin(1)
-				.constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
-				.split(size);
-			let main_area = columns[0];
-			let info_area = columns[1];
-
-			match &app.mode {
-				Mode::Menu => {
-					let chunks = Layout::default()
-						.direction(Direction::Vertical)
-						.constraints([
-							Constraint::Length(3), // title / help
-							Constraint::Min(5),    // menu list
-							Constraint::Length(1), // status line
-						])
-						.split(main_area);
-
-					let header = Paragraph::new("PuppyPeer")
-						.style(Style::default().fg(Color::Yellow))
-						.block(Block::default().borders(Borders::ALL).title("Header"));
-					f.render_widget(header, chunks[0]);
-
-					let items: Vec<ListItem> =
-						app.menu_items.iter().map(|m| ListItem::new(*m)).collect();
-					let list = List::new(items)
-						.block(Block::default().borders(Borders::ALL).title("Menu"))
-						.highlight_style(
-							Style::default()
-								.fg(Color::Cyan)
-								.add_modifier(Modifier::BOLD | Modifier::REVERSED),
-						)
-						.highlight_symbol("▶ ");
-					f.render_stateful_widget(list, chunks[1], &mut app.menu_state);
-
-					let status = Paragraph::new(app.status_line.as_str())
-						.block(Block::default().borders(Borders::ALL).title("Status"));
-					f.render_widget(status, chunks[2]);
-				}
-				Mode::PeerActions(state) => {
-					let chunks = Layout::default()
-						.direction(Direction::Vertical)
-						.constraints([
-							Constraint::Length(3), // title
-							Constraint::Min(5),    // actions list
-							Constraint::Length(1), // status
-						])
-						.split(main_area);
-
-					let title = format!("Actions for {}", state.menu.peer.id);
-					let header = Paragraph::new(title)
-						.style(Style::default().fg(Color::Green))
-						.block(Block::default().borders(Borders::ALL).title("Header"));
-					f.render_widget(header, chunks[0]);
-
-					let items: Vec<ListItem> = state
-						.menu
-						.items
-						.iter()
-						.enumerate()
-						.map(|(idx, item)| {
-							let style = if idx == state.menu.selected {
-								Style::default()
-									.fg(Color::Cyan)
-									.add_modifier(Modifier::BOLD)
-							} else {
-								Style::default()
-							};
-							let prefix = if idx == state.menu.selected {
-								"▶ "
-							} else {
-								"  "
-							};
-							ListItem::new(format!("{}{}", prefix, item)).style(style)
-						})
-						.collect();
-
-					let list = List::new(items).block(
-						Block::default()
-							.borders(Borders::ALL)
-							.title("Peer Actions (Enter select, Esc back)"),
-					);
-					f.render_widget(list, chunks[1]);
-
-					let status = Paragraph::new(app.status_line.as_str())
-						.block(Block::default().borders(Borders::ALL).title("Status"));
-					f.render_widget(status, chunks[2]);
-				}
-				Mode::FileBrowser(view) => {
-					use ratatui::widgets::{Row, Table};
-					let chunks = Layout::default()
-						.direction(Direction::Vertical)
-						.constraints([
-							Constraint::Length(3), // title
-							Constraint::Min(5),    // table
-							Constraint::Length(1), // status
-						])
-						.split(main_area);
-
-					let header = Paragraph::new(format!("File Browser — {}", view.path))
-						.style(Style::default().fg(Color::Blue))
-						.block(
-							Block::default()
-								.borders(Borders::ALL)
-								.title(format!("Peer: {}", view.peer_id)),
-						);
-					f.render_widget(header, chunks[0]);
-
-					let header_row = Row::new(vec!["Idx", "Name", "Type", "Size"])
-						.style(Style::default().add_modifier(Modifier::BOLD));
-					let rows: Vec<Row> = view
-						.entries
-						.iter()
-						.enumerate()
-						.map(|(idx, entry)| {
-							let style = if idx == view.selected {
-								Style::default().fg(Color::Cyan)
-							} else {
-								Style::default()
-							};
-							let display_name = if entry.is_dir {
-								format!("{}/", entry.name)
-							} else {
-								entry.name.clone()
-							};
-							let entry_type = if entry.is_dir { "dir" } else { "file" };
-							Row::new(vec![
-								format!("{}", idx),
-								display_name,
-								entry_type.into(),
-								format_size(entry.size),
-							])
-							.style(style)
-						})
-						.collect();
-
-					let widths = [
-						Constraint::Length(4),
-						Constraint::Percentage(60),
-						Constraint::Length(6),
-						Constraint::Length(12),
-					];
-
-					let table = Table::new(rows, &widths)
-						.header(header_row)
-						.block(
-							Block::default()
-								.borders(Borders::ALL)
-								.title("Files (Enter=open, Backspace=up, Esc=back)"),
-						)
-						.highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-					f.render_widget(table, chunks[1]);
-
-					let status = Paragraph::new(app.status_line.as_str())
-						.block(Block::default().borders(Borders::ALL).title("Status"));
-					f.render_widget(status, chunks[2]);
-				}
-				Mode::Peers(view) => {
-					use ratatui::widgets::{Row, Table};
-					let chunks = Layout::default()
-						.direction(Direction::Vertical)
-						.constraints([
-							Constraint::Length(3), // title
-							Constraint::Min(5),    // table
-							Constraint::Length(1), // status
-						])
-						.split(main_area);
-
-					let header = Paragraph::new("Peers")
-						.style(Style::default().fg(Color::Green))
-						.block(Block::default().borders(Borders::ALL).title("Header"));
-					f.render_widget(header, chunks[0]);
-
-					let header_row = Row::new(vec!["Idx", "Peer ID", "Address", "Status"])
-						.style(Style::default().add_modifier(Modifier::BOLD));
-					let rows: Vec<Row> = view
-						.peers
-						.iter()
-						.enumerate()
-						.map(|(i, p)| {
-							let style = if i == view.selected {
-								Style::default().fg(Color::Cyan)
-							} else {
-								Style::default()
-							};
-							Row::new(vec![
-								format!("{}", i),
-								p.id.clone(),
-								p.address.clone(),
-								p.status.clone(),
-							])
-							.style(style)
-						})
-						.collect();
-
-					let widths = [
-						Constraint::Length(4),
-						Constraint::Length(16),
-						Constraint::Percentage(50),
-						Constraint::Length(12),
-					];
-					let table = Table::new(rows, &widths)
-						.header(header_row)
-						.block(
-							Block::default()
-								.borders(Borders::ALL)
-								.title("Peers (r=refresh, Esc=back)"),
-						)
-						.highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-					f.render_widget(table, chunks[1]);
-
-					let status = Paragraph::new(app.status_line.as_str())
-						.block(Block::default().borders(Borders::ALL).title("Status"));
-					f.render_widget(status, chunks[2]);
-				}
-				Mode::CreateUser(form) => {
-					let chunks = Layout::default()
-						.direction(Direction::Vertical)
-						.constraints([
-							Constraint::Length(3), // title
-							Constraint::Min(5),    // form
-							Constraint::Length(1), // status
-						])
-						.split(main_area);
-
-					let header = Paragraph::new("Create User")
-						.style(Style::default().fg(Color::Magenta))
-						.block(Block::default().borders(Borders::ALL).title("Header"));
-					f.render_widget(header, chunks[0]);
-
-					let form_chunks = Layout::default()
-						.direction(Direction::Vertical)
-						.margin(1)
-						.constraints([
-							Constraint::Length(3),
-							Constraint::Length(3),
-							Constraint::Min(1),
-						])
-						.split(chunks[1]);
-
-					let username_label = format!("Username: {}", form.username);
-					let password_mask: String = "*".repeat(form.password.len());
-					let password_label = format!("Password: {}", password_mask);
-
-					let username_para = Paragraph::new(username_label)
-						.block(
-							Block::default()
-								.borders(Borders::ALL)
-								.title(match form.field {
-									ActiveField::Username => "[Username]*",
-									ActiveField::Password => "Username",
-								}),
-						)
-						.style(match form.field {
-							ActiveField::Username => Style::default().fg(Color::Cyan),
-							_ => Style::default(),
-						})
-						.wrap(Wrap { trim: true });
-
-					let password_para = Paragraph::new(password_label)
-						.block(
-							Block::default()
-								.borders(Borders::ALL)
-								.title(match form.field {
-									ActiveField::Password => "[Password]*",
-									ActiveField::Username => "Password",
-								}),
-						)
-						.style(match form.field {
-							ActiveField::Password => Style::default().fg(Color::Cyan),
-							_ => Style::default(),
-						})
-						.wrap(Wrap { trim: true });
-
-					let help = Paragraph::new("Tab: switch field | Enter: submit | Esc: cancel")
-						.block(Block::default().borders(Borders::ALL).title("Help"));
-
-					f.render_widget(username_para, form_chunks[0]);
-					f.render_widget(password_para, form_chunks[1]);
-					f.render_widget(help, form_chunks[2]);
-
-					let status = Paragraph::new(app.status_line.as_str())
-						.block(Block::default().borders(Borders::ALL).title("Status"));
-					f.render_widget(status, chunks[2]);
-				}
-				Mode::PeersGraph(graph) => {
-					let chunks = Layout::default()
-						.direction(Direction::Vertical)
-						.constraints([
-							Constraint::Length(3), // title
-							Constraint::Min(5),    // canvas
-							Constraint::Length(1), // status
-						])
-						.split(main_area);
-
-					let header = Paragraph::new("Peers Graph")
-						.style(Style::default().fg(Color::Blue))
-						.block(Block::default().borders(Borders::ALL).title("Header"));
-					f.render_widget(header, chunks[0]);
-
-					// Canvas coordinate system: we'll use (-1.2,-1.0) to (1.2,1.0) to leave some margin
-					let peers_clone = graph
-						.peers
-						.iter()
-						.enumerate()
-						.map(|(i, n)| (i, n.id.clone(), n.angle))
-						.collect::<Vec<_>>();
-					let selected = graph.selected;
-					let canvas = Canvas::default()
-						.block(
-							Block::default()
-								.borders(Borders::ALL)
-								.title("Graph (r=refresh, ←/→ select, Esc back)"),
-						)
-						.x_bounds([-1.3, 1.3])
-						.y_bounds([-1.1, 1.1])
-						.paint(move |ctx| {
-							// Draw connecting lines (complete graph for placeholder)
-							for (i1, _id1, a1) in &peers_clone {
-								let x1 = a1.cos();
-								let y1 = a1.sin();
-								for (i2, _id2, a2) in &peers_clone {
-									if i1 < i2 {
-										// avoid duplicates
-										let x2 = a2.cos();
-										let y2 = a2.sin();
-										ctx.draw(&Line {
-											x1,
-											y1,
-											x2,
-											y2,
-											color: Color::DarkGray,
-										});
-									}
-								}
-							}
-							// Draw nodes
-							for (i, id, a) in &peers_clone {
-								let x = a.cos();
-								let y = a.sin();
-								let color = if *i == selected {
-									Color::Cyan
-								} else {
-									Color::White
-								};
-								ctx.draw(&Points {
-									coords: &[(x, y)],
-									color,
-								});
-								// Simple label: first 5 chars radial outward
-								let label: String = id.chars().take(5).collect();
-								let lx = x * 1.1;
-								let ly = y * 1.1;
-								ctx.print(lx, ly, label);
-							}
-						});
-					f.render_widget(canvas, chunks[1]);
-
-					let status = Paragraph::new(app.status_line.as_str())
-						.block(Block::default().borders(Borders::ALL).title("Status"));
-					f.render_widget(status, chunks[2]);
-				}
-			}
-
-			render_peer_info(f, info_area, &app);
-		})?;
+		terminal.draw(|f| app.render(f))?;
 
 		if event::poll(Duration::from_millis(200))? {
 			let event = event::read()?;
