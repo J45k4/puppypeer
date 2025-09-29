@@ -10,7 +10,6 @@ use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use libp2p::{PeerId, Swarm, mdns, swarm::SwarmEvent};
 use std::collections::HashMap;
-use std::os::unix::fs::MetadataExt;
 use std::sync::{Arc, Mutex};
 use std::{env, path::Path};
 use sysinfo::{Networks, System};
@@ -105,7 +104,7 @@ impl App {
 						.unwrap_or_default(),
 					is_dir: file_type.is_dir(),
 					extension: ext,
-					size: meta.size(),
+					size: meta.len(),
 					created_at: meta
 						.created()
 						.ok()
@@ -286,7 +285,7 @@ impl App {
 				name: entry.file_name().to_string_lossy().to_string(),
 				is_dir: file_type.is_dir(),
 				extension,
-				size: metadata.size(),
+				size: metadata.len(),
 				created_at: metadata
 					.created()
 					.ok()
