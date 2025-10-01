@@ -7,7 +7,7 @@ use iced::alignment::{Horizontal, Vertical};
 use iced::executor;
 use iced::theme;
 use iced::time;
-use iced::widget::{button, container, scrollable, text, text_input, tooltip};
+use iced::widget::{button, container, scrollable, text, text_input, tooltip, pick_list};
 use iced::{Application, Command, Element, Length, Settings, Subscription, Theme};
 use libp2p::PeerId;
 use puppyagent_core::p2p::{CpuInfo, DirEntry};
@@ -21,13 +21,15 @@ pub enum MenuItem {
 	Peers,
 	PeersGraph,
 	CreateUser,
+	FileSearch,
 	Quit,
 }
 
-const MENU_ITEMS: [MenuItem; 4] = [
+const MENU_ITEMS: [MenuItem; 5] = [
 	MenuItem::Peers,
 	MenuItem::PeersGraph,
 	MenuItem::CreateUser,
+	MenuItem::FileSearch,
 	MenuItem::Quit,
 ];
 
@@ -37,6 +39,7 @@ impl MenuItem {
 			MenuItem::Peers => "Peers",
 			MenuItem::PeersGraph => "Peers Graph",
 			MenuItem::CreateUser => "Create User",
+			MenuItem::FileSearch => "File Search",
 			MenuItem::Quit => "Quit",
 		}
 	}
@@ -149,6 +152,42 @@ impl CreateUserForm {
 	}
 }
 
+#[derive(Debug, Clone)]
+struct FileSearchState {
+	query: String,
+	selected_mime: String,
+	mime_filter_input: String,
+	available_mime_types: Vec<String>,
+	sort_desc: bool,
+	results: Vec<FileSearchEntry>,
+	loading: bool,
+	error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileSearchEntry {
+	hash: String,
+	size: u64,
+	mime_type: Option<String>,
+	first: String,
+	latest: String,
+}
+
+impl FileSearchState {
+	fn new() -> Self {
+		Self {
+			query: String::new(),
+			selected_mime: String::new(),
+			mime_filter_input: String::new(),
+			available_mime_types: Vec::new(),
+			sort_desc: true,
+			results: Vec::new(),
+			loading: false,
+			error: None,
+		}
+	}
+}
+
 pub struct GuiApp {
 	peer: Arc<PuppyPeer>,
 	latest_state: Option<State>,
@@ -169,6 +208,7 @@ enum Mode {
 	FileBrowser(FileBrowserState),
 	PeersGraph,
 	CreateUser(CreateUserForm),
+	FileSearch(FileSearchState),
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +235,11 @@ pub enum GuiMessage {
 	UsernameChanged(String),
 	PasswordChanged(String),
 	CreateUserSubmit,
+	FileSearchQueryChanged(String),
+	FileSearchMimeChanged(String),
+	FileSearchToggleSort,
+	FileSearchExecute,
+	FileSearchLoaded(Result<(Vec<FileSearchEntry>, Vec<String>), String>),
 }
 
 impl Application for GuiApp {
@@ -273,6 +318,11 @@ impl Application for GuiApp {
 						self.menu = item;
 						self.mode = Mode::CreateUser(CreateUserForm::new());
 						self.status = String::from("Create user form");
+					}
+					MenuItem::FileSearch => {
+						self.menu = item;
+						self.mode = Mode::FileSearch(FileSearchState::new());
+						self.status = String::from("File search");
 					}
 				}
 				Command::none()
@@ -442,6 +492,39 @@ impl Application for GuiApp {
 				}
 				Command::none()
 			}
+			GuiMessage::FileSearchQueryChanged(q) => {
+				if let Mode::FileSearch(state) = &mut self.mode { state.query = q; }
+				Command::none()
+			}
+			GuiMessage::FileSearchMimeChanged(m) => {
+				if let Mode::FileSearch(state) = &mut self.mode { state.selected_mime = m; }
+				Command::none()
+			}
+			GuiMessage::FileSearchToggleSort => {
+				if let Mode::FileSearch(state) = &mut self.mode { state.sort_desc = !state.sort_desc; }
+				Command::none()
+			}
+			GuiMessage::FileSearchExecute => {
+				if let Mode::FileSearch(state) = &mut self.mode {
+					state.loading = true; state.error = None; state.results.clear();
+					let query = state.query.clone();
+					let mime = if state.selected_mime.trim().is_empty() { None } else { Some(state.selected_mime.clone()) };
+					let sort_desc = state.sort_desc;
+					let peer = self.peer.clone();
+					return Command::perform(search_files(peer, query, mime, sort_desc), GuiMessage::FileSearchLoaded);
+				}
+				Command::none()
+			}
+			GuiMessage::FileSearchLoaded(result) => {
+				if let Mode::FileSearch(state) = &mut self.mode {
+					state.loading = false;
+					match result {
+						Ok((entries, mimes)) => { state.results = entries; state.available_mime_types = mimes; self.status = format!("Search loaded: {} files", state.results.len()); }
+						Err(err) => { state.error = Some(err.clone()); self.status = format!("Search failed: {}", err); }
+					}
+				}
+				Command::none()
+			}
 		}
 	}
 
@@ -469,6 +552,7 @@ impl Application for GuiApp {
 			Mode::FileBrowser(state) => self.view_file_browser(state),
 			Mode::PeersGraph => self.view_graph(),
 			Mode::CreateUser(form) => self.view_create_user(form),
+			Mode::FileSearch(state) => self.view_file_search(state),
 		};
 		let content_container = container(content)
 			.width(Length::Fill)
@@ -757,6 +841,48 @@ impl GuiApp {
 		layout.into()
 	}
 
+	fn view_file_search(&self, state: &FileSearchState) -> Element<'_, GuiMessage> {
+		let mut layout = iced::widget::Column::new().spacing(12);
+		layout = layout.push(text("File Search").size(24));
+		// query input
+		layout = layout.push(
+			text_input("Search text (substring)", &state.query)
+				.on_input(GuiMessage::FileSearchQueryChanged),
+		);
+		// mime pick list (simple typed filter) using available list; allow empty selection
+		let mut mime_options = state.available_mime_types.clone();
+		mime_options.sort();
+		layout = layout.push(
+			pick_list(
+				mime_options,
+				if state.selected_mime.is_empty() { None } else { Some(state.selected_mime.clone()) },
+				|v| GuiMessage::FileSearchMimeChanged(v),
+			)
+			.placeholder("(any mime type)"),
+		);
+		// sort toggle
+		let sort_label = if state.sort_desc { "Sort: Latest ↓" } else { "Sort: Latest ↑" };
+		let controls_row = iced::widget::Row::new()
+			.spacing(12)
+			.push(button(text(sort_label)).on_press(GuiMessage::FileSearchToggleSort))
+			.push(button(text("Search")).on_press(GuiMessage::FileSearchExecute));
+		layout = layout.push(controls_row);
+		if state.loading { return layout.push(text("Searching...")) .into(); }
+		if let Some(err) = &state.error { return layout.push(text(format!("Error: {}", err))).into(); }
+		if state.results.is_empty() { return layout.push(text("No results (run a search)")).into(); }
+		let mut list = iced::widget::Column::new().spacing(4);
+		for entry in &state.results {
+			let row = iced::widget::Row::new()
+				.spacing(8)
+				.push(text(&abbreviate_hash(&entry.hash)).size(14).width(Length::FillPortion(2)))
+				.push(text(entry.mime_type.clone().unwrap_or_else(|| "?".into())).size(14).width(Length::FillPortion(2)))
+				.push(text(format_size(entry.size)).size(14).width(Length::FillPortion(1)))
+				.push(text(entry.latest.clone()).size(14).width(Length::FillPortion(2)));
+			list = list.push(container(row).padding(4).style(theme::Container::Box));
+		}
+		layout.push(scrollable(list).height(Length::Fill)).into()
+	}
+
 	fn gather_known_addresses(&self, peer_id: &str) -> Vec<String> {
 		if let Some(state) = &self.latest_state {
 			if let Ok(target) = PeerId::from_str(peer_id) {
@@ -873,6 +999,11 @@ fn abbreviate_peer_id(id: &str) -> String {
 	}
 }
 
+fn abbreviate_hash(hash_hex: &str) -> String {
+	const PREFIX: usize = 8; const SUFFIX: usize = 8;
+	if hash_hex.len() <= PREFIX + SUFFIX + 1 { hash_hex.to_string() } else { format!("{}…{}", &hash_hex[..PREFIX], &hash_hex[hash_hex.len()-SUFFIX..]) }
+}
+
 fn join_child_path(base: &str, child: &str) -> String {
 	if base.is_empty() || base == "/" {
 		format!("/{}", child.trim_start_matches('/'))
@@ -933,6 +1064,18 @@ async fn fetch_dir_entries(
 		}
 	};
 	(peer_id, path, result)
+}
+
+async fn search_files(
+	_peer: Arc<PuppyPeer>,
+	_query: String,
+	mime: Option<String>,
+	sort_desc: bool,
+) -> Result<(Vec<FileSearchEntry>, Vec<String>), String> {
+	// Placeholder in-memory search over local sqlite not yet wired: return empty until DB API exposed.
+	// For now, we just simulate no results but allow UI to function.
+	let _ = (_query, mime, sort_desc); // suppress warnings
+	Ok((Vec::new(), Vec::new()))
 }
 
 pub fn run() -> iced::Result {
