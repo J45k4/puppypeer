@@ -11,7 +11,10 @@ use crossterm::{
 	terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use libp2p::PeerId;
-use puppyagent_core::{PuppyPeer, State, p2p::DirEntry};
+use puppyagent_core::{
+	PuppyPeer, State,
+	p2p::{CpuInfo, DirEntry},
+};
 use ratatui::{
 	Frame, Terminal,
 	backend::CrosstermBackend,
@@ -22,6 +25,7 @@ use ratatui::{
 		canvas::{Canvas, Line, Points},
 	},
 };
+use sysinfo::System;
 
 const LOCAL_LISTEN_MULTIADDR: &str = "/ip4/0.0.0.0:8336";
 
@@ -29,6 +33,7 @@ enum Mode {
 	Menu,
 	Peers(PeersView),
 	PeerActions(PeerActionsState),
+	PeerCpus(PeerCpuView),
 	FileBrowser(FileBrowserView),
 	CreateUser(CreateUserForm),
 	PeersGraph(GraphView),
@@ -165,7 +170,7 @@ impl PeerActionsMenu {
 	fn new(peer: PeerRow) -> Self {
 		Self {
 			peer,
-			items: vec!["file browser", "back"],
+			items: vec!["cpu info", "file browser", "back"],
 			selected: 0,
 		}
 	}
@@ -289,6 +294,105 @@ impl FileBrowserView {
 		self.selected = 0;
 		self.scroll = 0;
 		self.clamp_scroll();
+	}
+}
+
+struct PeerCpuView {
+	peer_id: String,
+	cpus: Vec<CpuInfo>,
+	selected: usize,
+	scroll: usize,
+	viewport: usize,
+	last_refresh: Instant,
+}
+
+impl PeerCpuView {
+	fn new(peer_id: String, cpus: Vec<CpuInfo>) -> Self {
+		let mut view = Self {
+			peer_id,
+			cpus: Vec::new(),
+			selected: 0,
+			scroll: 0,
+			viewport: 1,
+			last_refresh: Instant::now(),
+		};
+		view.replace_cpus(cpus);
+		view
+	}
+
+	fn next(&mut self) {
+		if self.cpus.is_empty() {
+			return;
+		}
+		self.selected = if self.selected + 1 < self.cpus.len() {
+			self.selected + 1
+		} else {
+			self.scroll = 0;
+			0
+		};
+		self.clamp_scroll();
+	}
+
+	fn previous(&mut self) {
+		if self.cpus.is_empty() {
+			return;
+		}
+		self.selected = if self.selected == 0 {
+			let last = self.cpus.len().saturating_sub(1);
+			self.scroll = self.cpus.len().saturating_sub(self.viewport);
+			last
+		} else {
+			self.selected - 1
+		};
+		self.clamp_scroll();
+	}
+
+	fn selected_cpu(&self) -> Option<&CpuInfo> {
+		self.cpus.get(self.selected)
+	}
+
+	fn set_viewport(&mut self, viewport: usize) {
+		self.viewport = viewport.max(1);
+		self.clamp_scroll();
+	}
+
+	fn clamp_scroll(&mut self) {
+		if self.cpus.is_empty() {
+			self.selected = 0;
+			self.scroll = 0;
+			return;
+		}
+		if self.selected >= self.cpus.len() {
+			self.selected = self.cpus.len().saturating_sub(1);
+		}
+		let window = self.viewport.min(self.cpus.len());
+		if window == 0 {
+			self.scroll = 0;
+			return;
+		}
+		let max_scroll = self.cpus.len().saturating_sub(window);
+		if self.selected < self.scroll {
+			self.scroll = self.selected;
+		} else if self.selected >= self.scroll + window {
+			self.scroll = self.selected + 1 - window;
+		}
+		if self.scroll > max_scroll {
+			self.scroll = max_scroll;
+		}
+	}
+
+	fn replace_cpus(&mut self, cpus: Vec<CpuInfo>) {
+		self.cpus = cpus;
+		if self.cpus.is_empty() {
+			self.selected = 0;
+			self.scroll = 0;
+		}
+		self.clamp_scroll();
+		self.mark_refreshed();
+	}
+
+	fn mark_refreshed(&mut self) {
+		self.last_refresh = Instant::now();
 	}
 }
 
@@ -454,6 +558,18 @@ impl ShellApp {
 					KeyCode::Down => state.menu.next(),
 					KeyCode::Up => state.menu.previous(),
 					KeyCode::Enter => match state.menu.selected_item() {
+						Some("cpu info") => {
+							let peer_id = state.menu.peer.id.clone();
+							match self.create_cpu_view(peer_id.clone()) {
+								Ok(view) => {
+									self.status_line = Self::cpu_summary(&view);
+									next_mode = Some(Mode::PeerCpus(view));
+								}
+								Err(err) => {
+									self.status_line = format!("Failed to fetch CPUs: {}", err);
+								}
+							}
+						}
 						Some("file browser") => {
 							let peer_id = state.menu.peer.id.clone();
 							match self.create_file_browser_view(peer_id.clone(), "/") {
@@ -478,6 +594,23 @@ impl ShellApp {
 						self.should_quit = true;
 					}
 					KeyCode::Char('r') => {}
+					_ => {}
+				},
+				Mode::PeerCpus(view) => match key.code {
+					KeyCode::Esc => {
+						pending_peer_actions = Some(view.peer_id.clone());
+					}
+					KeyCode::Down => {
+						view.next();
+						self.status_line = Self::cpu_summary(view);
+					}
+					KeyCode::Up => {
+						view.previous();
+						self.status_line = Self::cpu_summary(view);
+					}
+					KeyCode::Char('q') => {
+						self.should_quit = true;
+					}
 					_ => {}
 				},
 				Mode::FileBrowser(view) => match key.code {
@@ -616,8 +749,20 @@ impl ShellApp {
 	}
 
 	fn create_file_browser_view(&self, peer_id: String, path: &str) -> Result<FileBrowserView> {
-		let entries = Self::fetch_dir_entries(&self.peer, &peer_id, path)?;
+		let local_id = self.latest_state.as_ref().map(|s| format!("{}", s.me));
+		let entries = if local_id.as_deref() == Some(peer_id.as_str()) {
+			self.peer
+				.list_dir_blocking(path.to_string())
+				.with_context(|| format!("listing {} locally", path))?
+		} else {
+			Self::fetch_dir_entries(&self.peer, &peer_id, path)?
+		};
 		Ok(FileBrowserView::new(peer_id, path.to_string(), entries))
+	}
+
+	fn create_cpu_view(&self, peer_id: String) -> Result<PeerCpuView> {
+		let cpus = self.peer.list_cpus_blocking(peer_id.parse()?)?;
+		Ok(PeerCpuView::new(peer_id, cpus))
 	}
 
 	fn fetch_dir_entries(peer: &PuppyPeer, peer_id: &str, path: &str) -> Result<Vec<DirEntry>> {
@@ -625,6 +770,39 @@ impl ShellApp {
 			PeerId::from_str(peer_id).with_context(|| format!("invalid peer id {peer_id}"))?;
 		peer.list_dir_remote_blocking(target, path.to_string())
 			.with_context(|| format!("listing {} on {}", path, peer_id))
+	}
+
+	// fn fetch_remote_cpus(peer: &PuppyPeer, peer_id: &str) -> Result<Vec<CpuInfo>> {
+	// 	let target =
+	// 		PeerId::from_str(peer_id).with_context(|| format!("invalid peer id {peer_id}"))?;
+	// 	peer.list_cpus_remote_blocking(target)
+	// 		.with_context(|| format!("listing CPUs on {}", peer_id))
+	// }
+
+	// fn sample_local_cpus(system: &mut System) -> Vec<CpuInfo> {
+	// 	system.refresh_cpu_usage();
+	// 	system
+	// 		.cpus()
+	// 		.iter()
+	// 		.map(|cpu| CpuInfo {
+	// 			name: cpu.name().to_string(),
+	// 			usage: cpu.cpu_usage(),
+	// 			frequency_hz: cpu.frequency(),
+	// 		})
+	// 		.collect()
+	// }
+
+	fn cpu_summary(view: &PeerCpuView) -> String {
+		view.selected_cpu()
+			.map(|cpu| {
+				format!(
+					"{}: {:.1}% @ {}",
+					cpu.name,
+					cpu.usage,
+					format_frequency(cpu.frequency_hz)
+				)
+			})
+			.unwrap_or_else(|| format!("No CPUs reported for {}", view.peer_id))
 	}
 
 	fn render(&mut self, f: &mut Frame<'_>) {
@@ -713,6 +891,78 @@ impl ShellApp {
 						.title("Peer Actions (Enter select, Esc back)"),
 				);
 				f.render_widget(list, chunks[1]);
+
+				let status = Paragraph::new(self.status_line.as_str())
+					.block(Block::default().borders(Borders::ALL).title("Status"));
+				f.render_widget(status, chunks[2]);
+			}
+			Mode::PeerCpus(view) => {
+				use ratatui::widgets::{Row, Table};
+				let chunks = Layout::default()
+					.direction(Direction::Vertical)
+					.constraints([
+						Constraint::Length(3), // title
+						Constraint::Min(5),    // table
+						Constraint::Length(1), // status
+					])
+					.split(main_area);
+
+				let header = Paragraph::new("CPU Inventory")
+					.style(Style::default().fg(Color::Magenta))
+					.block(
+						Block::default()
+							.borders(Borders::ALL)
+							.title(format!("Peer: {}", view.peer_id)),
+					);
+				f.render_widget(header, chunks[0]);
+
+				let viewport = if chunks[1].height > 1 {
+					(chunks[1].height - 1) as usize
+				} else {
+					1
+				};
+				view.set_viewport(viewport);
+
+				let header_row = Row::new(vec!["Idx", "CPU", "Usage", "Frequency"])
+					.style(Style::default().add_modifier(Modifier::BOLD));
+				let rows: Vec<Row> = view
+					.cpus
+					.iter()
+					.enumerate()
+					.skip(view.scroll)
+					.take(view.viewport)
+					.map(|(idx, cpu)| {
+						let style = if idx == view.selected {
+							Style::default().fg(Color::Cyan)
+						} else {
+							Style::default()
+						};
+						Row::new(vec![
+							format!("{}", idx),
+							cpu.name.clone(),
+							format!("{:.1}%", cpu.usage),
+							format_frequency(cpu.frequency_hz),
+						])
+						.style(style)
+					})
+					.collect();
+
+				let widths = [
+					Constraint::Length(4),
+					Constraint::Percentage(50),
+					Constraint::Length(10),
+					Constraint::Length(12),
+				];
+
+				let table = Table::new(rows, &widths)
+					.header(header_row)
+					.block(
+						Block::default()
+							.borders(Borders::ALL)
+							.title("CPUs (↑/↓ scroll, Esc=back)"),
+					)
+					.highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+				f.render_widget(table, chunks[1]);
 
 				let status = Paragraph::new(self.status_line.as_str())
 					.block(Block::default().borders(Borders::ALL).title("Status"));
@@ -1042,6 +1292,24 @@ impl ShellApp {
 						self.status_line =
 							format!("Auto-refreshed graph ({} nodes)", graph.peers.len());
 					}
+					Mode::PeerCpus(view) => {
+						if view.last_refresh.elapsed() >= self.refresh_interval {
+							match self.peer.list_cpus_blocking(view.peer_id.parse().unwrap()) {
+								Ok(cpus) => {
+									view.replace_cpus(cpus);
+									let headline = Self::cpu_summary(view);
+									self.status_line = format!("Refreshed CPUs — {}", headline);
+								}
+								Err(err) => {
+									view.mark_refreshed();
+									self.status_line = format!(
+										"CPU refresh failed for {}: {}",
+										view.peer_id, err
+									);
+								}
+							}
+						}
+					}
 					_ => {}
 				}
 			} else {
@@ -1093,6 +1361,19 @@ impl ShellApp {
 				status: String::new(),
 			});
 		}
+		let me_id = format!("{}", state.me);
+		rows.entry(me_id.clone())
+			.and_modify(|r| {
+				if r.address.is_empty() {
+					r.address = LOCAL_LISTEN_MULTIADDR.into();
+				}
+				r.status = "local".into();
+			})
+			.or_insert(PeerRow {
+				id: me_id,
+				address: LOCAL_LISTEN_MULTIADDR.into(),
+				status: "local".into(),
+			});
 		let mut vec: Vec<PeerRow> = rows.into_iter().map(|(_, v)| v).collect();
 		vec.sort_by(|a, b| a.id.cmp(&b.id));
 		vec
@@ -1198,6 +1479,35 @@ impl ShellApp {
 					lines.push("Directory is empty".into());
 				}
 				("File Browser".into(), lines)
+			}
+			Mode::PeerCpus(view) => {
+				let mut lines = Vec::new();
+				lines.push(format!("Peer: {}", view.peer_id));
+				if view.cpus.is_empty() {
+					lines.push("No CPU data available".into());
+				} else {
+					lines.push(format!("Logical CPUs: {}", view.cpus.len()));
+					if let Some(cpu) = view.selected_cpu() {
+						lines.push(format!(
+							"Selected: {} ({:.1}% @ {})",
+							cpu.name,
+							cpu.usage,
+							format_frequency(cpu.frequency_hz)
+						));
+					}
+					for cpu in view.cpus.iter().take(5) {
+						lines.push(format!(
+							"{} ({:.1}% @ {})",
+							cpu.name,
+							cpu.usage,
+							format_frequency(cpu.frequency_hz)
+						));
+					}
+					if view.cpus.len() > 5 {
+						lines.push(format!("(+{} more)", view.cpus.len() - 5));
+					}
+				}
+				("CPU Info".into(), lines)
 			}
 			Mode::PeersGraph(graph) if !graph.peers.is_empty() => {
 				let node = &graph.peers[graph.selected];
@@ -1324,6 +1634,17 @@ fn format_size(size: u64) -> String {
 		format!("{} {}", size, UNITS[unit_index])
 	} else {
 		format!("{:.1} {}", value, UNITS[unit_index])
+	}
+}
+
+fn format_frequency(freq_mhz: u64) -> String {
+	if freq_mhz == 0 {
+		return "0 MHz".into();
+	}
+	if freq_mhz >= 1000 {
+		format!("{:.2} GHz", freq_mhz as f64 / 1000.0)
+	} else {
+		format!("{} MHz", freq_mhz)
 	}
 }
 

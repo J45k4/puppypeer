@@ -7,8 +7,10 @@ use crate::{
 };
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
+use futures::executor::block_on;
 use futures::StreamExt;
 use libp2p::{PeerId, Swarm, mdns, swarm::SwarmEvent};
+use tokio::task::block_in_place;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::{env, path::Path};
@@ -39,13 +41,23 @@ pub enum Command {
 		path: String,
 		tx: oneshot::Sender<Result<Vec<DirEntry>>>,
 	},
+	ListCpus {
+		tx: oneshot::Sender<Result<Vec<CpuInfo>>>,
+		peer_id: PeerId
+	},
 }
 
 pub struct App {
 	state: Arc<Mutex<State>>,
 	swarm: Swarm<AgentBehaviour>,
 	rx: UnboundedReceiver<Command>,
-	pending_dir_requests: HashMap<OutboundRequestId, oneshot::Sender<Result<Vec<DirEntry>>>>,
+	pending_requests: HashMap<OutboundRequestId, PendingRequest>,
+	system: System
+}
+
+enum PendingRequest {
+	DirEntries(oneshot::Sender<Result<Vec<DirEntry>>>),
+	Cpus(oneshot::Sender<Result<Vec<CpuInfo>>>),
 }
 
 impl App {
@@ -77,7 +89,8 @@ impl App {
 				state,
 				swarm,
 				rx,
-				pending_dir_requests: HashMap::new(),
+				pending_requests: HashMap::new(),
+				system: System::new(),
 			},
 			tx,
 		)
@@ -191,17 +204,7 @@ impl App {
 				})
 			}
 			PeerReq::ListCpus => {
-				let mut system = System::new_all();
-				system.refresh_cpu_usage();
-				let cpus = system
-					.cpus()
-					.iter()
-					.map(|cpu| CpuInfo {
-						name: cpu.name().to_string(),
-						usage: cpu.cpu_usage(),
-						frequency_hz: cpu.frequency(),
-					})
-					.collect();
+				let cpus = self.collect_cpu_info();
 				PeerRes::Cpus(cpus)
 			}
 			PeerReq::ListDisks => PeerRes::Error("ListDisks not implemented".into()),
@@ -263,6 +266,19 @@ impl App {
 			PeerReq::RevokeUser { .. } => PeerRes::Error("RevokeUser not implemented".into()),
 		};
 		Ok(res)
+	}
+
+	fn collect_cpu_info(&mut self) -> Vec<CpuInfo> {
+		self.system.refresh_cpu_usage();
+		self.system
+			.cpus()
+			.iter()
+			.map(|cpu| CpuInfo {
+				name: cpu.name().to_string(),
+				usage: cpu.cpu_usage(),
+				frequency_hz: cpu.frequency(),
+			})
+			.collect()
 	}
 
 	async fn collect_dir_entries(path: &str) -> Result<Vec<DirEntry>> {
@@ -344,13 +360,36 @@ impl App {
 								request_id,
 								response,
 							} => {
-								if let Some(tx) = self.pending_dir_requests.remove(&request_id) {
-									let result = match response {
-										PeerRes::DirEntries(entries) => Ok(entries),
-										PeerRes::Error(err) => Err(anyhow!(err)),
-										other => Err(anyhow!("unexpected response: {:?}", other)),
-									};
-									let _ = tx.send(result);
+								if let Some(pending) = self.pending_requests.remove(&request_id) {
+									match (pending, response) {
+										(
+											PendingRequest::DirEntries(tx),
+											PeerRes::DirEntries(entries),
+										) => {
+											let _ = tx.send(Ok(entries));
+										}
+										(PendingRequest::Cpus(tx), PeerRes::Cpus(cpus)) => {
+											let _ = tx.send(Ok(cpus));
+										}
+										(PendingRequest::DirEntries(tx), PeerRes::Error(err)) => {
+											let _ = tx.send(Err(anyhow!(err)));
+										}
+										(PendingRequest::Cpus(tx), PeerRes::Error(err)) => {
+											let _ = tx.send(Err(anyhow!(err)));
+										}
+										(PendingRequest::DirEntries(tx), other) => {
+											let _ = tx.send(Err(anyhow!(
+												"unexpected response: {:?}",
+												other
+											)));
+										}
+										(PendingRequest::Cpus(tx), other) => {
+											let _ = tx.send(Err(anyhow!(
+												"unexpected response: {:?}",
+												other
+											)));
+										}
+									}
 								}
 							}
 						}
@@ -362,8 +401,15 @@ impl App {
 						error,
 					} => {
 						log::warn!("outbound request to {} failed: {error}", peer);
-						if let Some(tx) = self.pending_dir_requests.remove(&request_id) {
-							let _ = tx.send(Err(anyhow!("request failed: {error}")));
+						if let Some(pending) = self.pending_requests.remove(&request_id) {
+							match pending {
+								PendingRequest::DirEntries(tx) => {
+									let _ = tx.send(Err(anyhow!("request failed: {error}")));
+								}
+								PendingRequest::Cpus(tx) => {
+									let _ = tx.send(Err(anyhow!("request failed: {error}")));
+								}
+							}
 						}
 					}
 					libp2p::request_response::Event::InboundFailure {
@@ -509,15 +555,49 @@ impl App {
 					.behaviour_mut()
 					.puppypeer
 					.send_request(&peer, PeerReq::ListDir { path: path.clone() });
-				if let Some(prev) = self.pending_dir_requests.insert(request_id, tx) {
-					let _ = prev.send(Err(anyhow!("request superseded")));
+				if let Some(prev) = self
+					.pending_requests
+					.insert(request_id, PendingRequest::DirEntries(tx))
+				{
+					match prev {
+						PendingRequest::DirEntries(tx) => {
+							let _ = tx.send(Err(anyhow!("request superseded")));
+						}
+						PendingRequest::Cpus(tx) => {
+							let _ = tx.send(Err(anyhow!("request superseded")));
+						}
+					}
+				}
+			}
+			Command::ListCpus { tx, peer_id } => {
+				if self.state.lock().unwrap().me == peer_id {
+					let cpus = self.collect_cpu_info();
+					let _ = tx.send(Ok(cpus));
+					return;
+				}
+				let request_id = self
+					.swarm
+					.behaviour_mut()
+					.puppypeer
+					.send_request(&peer_id, PeerReq::ListCpus);
+				if let Some(prev) = self
+					.pending_requests
+					.insert(request_id, PendingRequest::Cpus(tx))
+				{
+					match prev {
+						PendingRequest::DirEntries(tx) => {
+							let _ = tx.send(Err(anyhow!("request superseded")));
+						}
+						PendingRequest::Cpus(tx) => {
+							let _ = tx.send(Err(anyhow!("request superseded")));
+						}
+					}
 				}
 			}
 		}
 	}
 
 	pub async fn run(&mut self) {
-		//log::info!("run");
 		tokio::select! {
 			event = self.swarm.select_next_some() => {
 				self.handle_swarm_event(event).await;
@@ -578,6 +658,20 @@ impl PuppyPeer {
 			.map_err(|e| anyhow!("failed to send ListDir command: {e}"))?;
 		rx.await
 			.map_err(|e| anyhow!("ListDir response channel closed: {e}"))?
+	}
+
+	pub async fn list_cpus(&self, peer_id: PeerId) -> Result<Vec<CpuInfo>> {
+		let (tx, rx) = oneshot::channel();
+		self.cmd_tx
+			.send(Command::ListCpus { tx, peer_id })
+			.map_err(|e| anyhow!("failed to send ListCpus command: {e}"))?;
+		rx.await
+			.map_err(|e| anyhow!("ListCpus response channel closed: {e}"))?
+	}
+
+	pub fn list_cpus_blocking(&self, peer_id: PeerId) -> Result<Vec<CpuInfo>> {
+		let cpus = block_on(self.list_cpus(peer_id));
+		cpus
 	}
 
 	pub fn list_dir_blocking(&self, path: impl Into<String>) -> Result<Vec<DirEntry>> {
