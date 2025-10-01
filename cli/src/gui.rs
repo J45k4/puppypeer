@@ -7,7 +7,7 @@ use iced::alignment::{Horizontal, Vertical};
 use iced::executor;
 use iced::theme;
 use iced::time;
-use iced::widget::{button, container, scrollable, text, text_input};
+use iced::widget::{button, container, scrollable, text, text_input, tooltip};
 use iced::{Application, Command, Element, Length, Settings, Subscription, Theme};
 use libp2p::PeerId;
 use puppyagent_core::p2p::{CpuInfo, DirEntry};
@@ -549,13 +549,19 @@ impl GuiApp {
 				} else {
 					""
 				};
+				let id_label = format!("{} {}", indicator, abbreviate_peer_id(&peer.id));
+				let id_cell = container(
+					tooltip(
+						text(id_label).size(16),
+						text(peer.id.clone()),
+						tooltip::Position::FollowCursor,
+					)
+					.style(theme::Container::Box),
+				)
+				.width(Length::FillPortion(2));
 				let info = iced::widget::Row::new()
 					.spacing(12)
-					.push(
-						text(format!("{} {}", indicator, peer.id))
-							.size(16)
-							.width(Length::FillPortion(2)),
-					)
+					.push(id_cell)
 					.push(
 						text(peer.address.clone())
 							.size(14)
@@ -854,6 +860,16 @@ fn format_size(bytes: u64) -> String {
 		format!("{} {}", bytes, UNITS[unit])
 	} else {
 		format!("{:.2} {}", value, UNITS[unit])
+	}
+}
+
+fn abbreviate_peer_id(id: &str) -> String {
+	const PREFIX: usize = 8;
+	const SUFFIX: usize = 6;
+	if id.len() <= PREFIX + SUFFIX + 1 {
+		id.to_string()
+	} else {
+		format!("{}…{}", &id[..PREFIX], &id[id.len() - SUFFIX..])
 	}
 }
 
