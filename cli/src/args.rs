@@ -1,6 +1,4 @@
 use clap::Parser;
-use clap::Subcommand;
-
 #[derive(Debug, Parser)]
 #[clap(name = "puppyagent")]
 pub struct Args {
@@ -22,5 +20,6 @@ pub enum Command {
 	Uninstall,
 	Update { version: Option<String> },
 	Tui,
+	Gui,
 	Daemon,
 }

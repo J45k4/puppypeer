@@ -25,8 +25,6 @@ use ratatui::{
 		canvas::{Canvas, Line, Points},
 	},
 };
-use sysinfo::System;
-
 const LOCAL_LISTEN_MULTIADDR: &str = "/ip4/0.0.0.0:8336";
 
 enum Mode {
@@ -1302,10 +1300,8 @@ impl ShellApp {
 								}
 								Err(err) => {
 									view.mark_refreshed();
-									self.status_line = format!(
-										"CPU refresh failed for {}: {}",
-										view.peer_id, err
-									);
+									self.status_line =
+										format!("CPU refresh failed for {}: {}", view.peer_id, err);
 								}
 							}
 						}

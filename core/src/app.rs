@@ -7,16 +7,16 @@ use crate::{
 };
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
-use futures::executor::block_on;
 use futures::StreamExt;
+use futures::executor::block_on;
 use libp2p::{PeerId, Swarm, mdns, swarm::SwarmEvent};
-use tokio::task::block_in_place;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::{env, path::Path};
 use sysinfo::{Networks, System};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::task::block_in_place;
 use tokio::{
 	sync::{
 		mpsc::{UnboundedReceiver, UnboundedSender},
@@ -43,7 +43,7 @@ pub enum Command {
 	},
 	ListCpus {
 		tx: oneshot::Sender<Result<Vec<CpuInfo>>>,
-		peer_id: PeerId
+		peer_id: PeerId,
 	},
 }
 
@@ -52,7 +52,7 @@ pub struct App {
 	swarm: Swarm<AgentBehaviour>,
 	rx: UnboundedReceiver<Command>,
 	pending_requests: HashMap<OutboundRequestId, PendingRequest>,
-	system: System
+	system: System,
 }
 
 enum PendingRequest {

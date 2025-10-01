@@ -4,6 +4,7 @@ use puppyagent_core::{PuppyPeer, wait_group::WaitGroup};
 use uuid::Uuid;
 
 mod args;
+mod gui;
 mod installer;
 mod service;
 mod shell;
@@ -55,6 +56,13 @@ async fn main() {
 			Command::Tui => {
 				if let Err(err) = shell::run() {
 					log::error!("shell error: {err:?}");
+					std::process::exit(1);
+				}
+				return;
+			}
+			Command::Gui => {
+				if let Err(err) = gui::run() {
+					log::error!("gui error: {err:?}");
 					std::process::exit(1);
 				}
 				return;
