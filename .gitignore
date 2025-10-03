@@ -3,3 +3,4 @@ tmp
 serverdb
 workdir
 peer_keypair.bin
+.DS_Store
