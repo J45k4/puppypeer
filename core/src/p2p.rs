@@ -134,6 +134,7 @@ pub struct DirEntry {
 	pub name: String,
 	pub is_dir: bool,
 	pub extension: Option<String>,
+	pub mime: Option<String>,
 	pub size: u64,
 	pub created_at: Option<DateTime<Utc>>,
 	pub modified_at: Option<DateTime<Utc>>,

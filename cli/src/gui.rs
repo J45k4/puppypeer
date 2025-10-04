@@ -8,7 +8,8 @@ use iced::alignment::{Horizontal, Vertical};
 use iced::executor;
 use iced::theme;
 use iced::time;
-use iced::widget::{button, container, scrollable, text, text_input, tooltip, pick_list};
+use iced::widget::{button, container, pick_list, scrollable, text, text_input, tooltip, Image};
+use iced::widget::image::Handle as ImageHandle;
 use iced::{Application, Command, Element, Length, Settings, Subscription, Theme};
 use libp2p::PeerId;
 use puppyagent_core::p2p::{CpuInfo, DirEntry};
@@ -86,6 +87,7 @@ struct FileViewerState {
 	browser: FileBrowserState,
 	peer_id: String,
 	path: String,
+	mime: Option<String>,
 	data: Vec<u8>,
 	offset: u64,
 	eof: bool,
@@ -94,10 +96,11 @@ struct FileViewerState {
 }
 
 impl FileViewerState {
-	fn new(browser: FileBrowserState, peer_id: String, path: String) -> Self {
+	fn new(browser: FileBrowserState, peer_id: String, path: String, mime: Option<String>) -> Self {
 		Self {
 			peer_id,
 			path,
+			mime,
 			browser,
 			data: Vec::new(),
 			offset: 0,
@@ -121,6 +124,14 @@ impl FileViewerState {
 			self.offset = offset;
 		}
 		self.eof = eof;
+	}
+
+	fn is_image(&self) -> bool {
+		self
+			.mime
+			.as_deref()
+			.map(|value| value.starts_with("image/"))
+			.unwrap_or(false)
 	}
 }
 
@@ -478,10 +489,12 @@ impl Application for GuiApp {
 					let target = join_child_path(&state.path, &entry.name);
 					let peer_id = state.peer_id.clone();
 					let browser_snapshot = state.clone();
+					let mime_label = entry.mime.clone().unwrap_or_else(|| String::from("?"));
 					self.status = format!(
-						"Reading {} ({})",
+						"Reading {} ({} | {})",
 						target,
-						format_size(entry.size)
+						format_size(entry.size),
+						mime_label
 					);
 					let peer = self.peer.clone();
 					let local = self.local_peer_id.clone();
@@ -505,6 +518,7 @@ impl Application for GuiApp {
 						browser_snapshot,
 						peer_id,
 						target,
+						entry.mime.clone(),
 					));
 					return command;
 				}
@@ -549,11 +563,22 @@ impl Application for GuiApp {
 							Ok(chunk) => {
 								state.error = None;
 								state.apply_chunk(chunk);
-								self.status = format!(
-									"Loaded {} bytes{}",
-									state.data.len(),
-									if state.eof { " (end of file)" } else { "" }
-								);
+								let mime_label = state.mime.clone().unwrap_or_else(|| String::from("?"));
+								if state.is_image() && state.eof && !state.data.is_empty() {
+									self.status = format!(
+										"Image loaded: {} bytes | {}",
+										state.data.len(),
+										mime_label,
+									);
+								} else {
+									let eof_note = if state.eof { " (end of file)" } else { "" };
+									self.status = format!(
+										"Loaded {} bytes{} | {}",
+										state.data.len(),
+										eof_note,
+										mime_label,
+									);
+								}
 							}
 							Err(err) => {
 								state.error = Some(err.clone());
@@ -945,6 +970,9 @@ impl GuiApp {
 		let mut layout = iced::widget::Column::new().spacing(12);
 		layout = layout.push(text(format!("Viewing {} on {}", state.path, state.peer_id)).size(24));
 		let mut summary = format!("Loaded {} bytes", state.data.len());
+		if let Some(mime) = &state.mime {
+			summary.push_str(&format!(" | {}", mime));
+		}
 		if state.eof {
 			summary.push_str(" (end of file)");
 		}
@@ -952,7 +980,29 @@ impl GuiApp {
 		if let Some(err) = &state.error {
 			layout = layout.push(text(format!("Error: {}", err)).size(14));
 		}
-		if !state.data.is_empty() {
+		if state.is_image() {
+			if state.data.is_empty() {
+				if state.loading {
+					layout = layout.push(text("Loading image data...").size(14));
+				} else {
+					layout = layout.push(text("Image data not yet loaded").size(14));
+				}
+			} else if !state.eof {
+				layout = layout.push(text("Partial image data loaded — load remaining bytes to render").size(14));
+			} else {
+				let handle = ImageHandle::from_memory(state.data.clone());
+				let image_view = Image::new(handle)
+					.width(Length::Shrink)
+					.height(Length::Shrink);
+				layout = layout.push(
+					container(image_view)
+						.width(Length::Fill)
+						.height(Length::Fill)
+						.align_x(Horizontal::Center)
+						.align_y(Vertical::Center),
+				);
+			}
+		} else if !state.data.is_empty() {
 			let (preview, lossy) = file_preview_text(&state.data);
 			let mut preview_column = iced::widget::Column::new().spacing(4);
 			if lossy {

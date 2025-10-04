@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use futures::executor::block_on;
 use libp2p::{PeerId, Swarm, mdns, swarm::SwarmEvent};
+use mime_guess;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::{env, path::Path};
@@ -241,6 +242,13 @@ impl App {
 				let ext = path
 					.extension()
 					.and_then(|s| s.to_str().map(|s| s.to_string()));
+				let mime = if file_type.is_dir() {
+					None
+				} else {
+					mime_guess::from_path(path)
+						.first_raw()
+						.map(|value| value.to_string())
+				};
 				PeerRes::FileStat(DirEntry {
 					name: path
 						.file_name()
@@ -248,6 +256,7 @@ impl App {
 						.unwrap_or_default(),
 					is_dir: file_type.is_dir(),
 					extension: ext,
+					mime,
 					size: meta.len(),
 					created_at: meta
 						.created()
@@ -359,10 +368,18 @@ impl App {
 				.path()
 				.extension()
 				.and_then(|s| s.to_str().map(|s| s.to_string()));
+			let mime = if file_type.is_dir() {
+				None
+			} else {
+				mime_guess::from_path(entry.path())
+					.first_raw()
+					.map(|value| value.to_string())
+			};
 			entries.push(DirEntry {
 				name: entry.file_name().to_string_lossy().to_string(),
 				is_dir: file_type.is_dir(),
 				extension,
+				mime,
 				size: metadata.len(),
 				created_at: metadata
 					.created()
