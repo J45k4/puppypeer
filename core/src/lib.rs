@@ -1,5 +1,6 @@
 mod app;
 mod db;
+mod types;
 pub mod p2p;
 pub mod scan;
 mod state;

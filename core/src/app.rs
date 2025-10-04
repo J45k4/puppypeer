@@ -5,7 +5,7 @@ use crate::{
 	p2p::{AgentBehaviour, AgentEvent, build_swarm, load_or_generate_keypair},
 	state::{Connection, State},
 };
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use futures::executor::block_on;
@@ -27,16 +27,20 @@ use tokio::{
 
 use libp2p::request_response::OutboundRequestId;
 
+pub struct ReadFileCmd {
+	peer_id: libp2p::PeerId,
+	path: String,
+	offset: u64,
+	length: Option<u64>,
+	tx: oneshot::Sender<Result<Vec<u8>>>,
+}
+
 pub enum Command {
 	Connect {
 		peer_id: libp2p::PeerId,
 		addr: libp2p::Multiaddr,
 	},
 	ListDir {
-		path: String,
-		tx: oneshot::Sender<Result<Vec<DirEntry>>>,
-	},
-	FetchDir {
 		peer: libp2p::PeerId,
 		path: String,
 		tx: oneshot::Sender<Result<Vec<DirEntry>>>,
@@ -45,6 +49,76 @@ pub enum Command {
 		tx: oneshot::Sender<Result<Vec<CpuInfo>>>,
 		peer_id: PeerId,
 	},
+	ReadFile(ReadFileCmd)
+}
+
+async fn read_file(path: &str, offset: u64, length: Option<u64>) -> Result<FileChunk> {
+	let file = fs::File::open(&path).await?;
+	let metadata = file.metadata().await?;
+	if metadata.is_dir() {
+		bail!("path is a directory")
+	}
+	let file_len = metadata.len();
+	if offset >= file_len {
+		return Ok(PeerRes::FileChunk(FileChunk {
+			offset,
+			data: Vec::new(),
+			eof: true,
+		}));
+	}
+	let remaining = file_len - offset;
+	let to_read = match length {
+		Some(l) => l.min(remaining),
+		None => remaining,
+	};
+	let mut reader = tokio::io::BufReader::new(file);
+	reader.seek(std::io::SeekFrom::Start(offset)).await?;
+	let mut buffer = vec![0u8; to_read as usize];
+	let n = reader.read(&mut buffer).await?;
+	buffer.truncate(n);
+	let eof = offset + n as u64 >= file_len;
+	Ok(FileChunk {
+		offset,
+		data: buffer,
+		eof,
+	})
+}
+
+async fn write_file(path: &str, offset: u64, data: &[u8]) -> Result<FileWriteAck> {
+	// Open (or create) file with write capability
+	let mut file = match fs::OpenOptions::new()
+		.create(true)
+		.write(true)
+		.read(true)
+		.open(&path)
+		.await
+	{
+		Ok(f) => f,
+		Err(e) => return Err(anyhow!("open failed: {}", e)),
+	};
+	// Ensure we don't overflow length when extending
+	let current_len = match file.metadata().await {
+		Ok(m) => m.len(),
+		Err(e) => return Err(anyhow!("metadata failed: {}", e)),
+	};
+	let required_len = match offset.checked_add(data.len() as u64) {
+		Some(v) => v,
+		None => return Err(anyhow!("length overflow")),
+	};
+	if required_len > current_len {
+		if let Err(e) = file.set_len(required_len).await {
+			return Err(anyhow!("set_len failed: {}", e));
+		}
+	}
+	if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
+		return Err(anyhow!("seek failed: {}", e));
+	}
+	if let Err(e) = file.write_all(data).await {
+		return Err(anyhow!("write failed: {}", e));
+	}
+	Ok(FileWriteAck {
+		bytes_written: data.len() as u64,
+	})
 }
 
 pub struct App {
@@ -58,6 +132,7 @@ pub struct App {
 enum PendingRequest {
 	DirEntries(oneshot::Sender<Result<Vec<DirEntry>>>),
 	Cpus(oneshot::Sender<Result<Vec<CpuInfo>>>),
+	ReadFile(oneshot::Sender<FileChunk>)
 }
 
 impl App {
@@ -132,77 +207,8 @@ impl App {
 						.and_then(|t| DateTime::<Utc>::from(t).into()),
 				})
 			}
-			PeerReq::ReadFile {
-				path,
-				offset,
-				length,
-			} => {
-				let file = fs::File::open(&path).await?;
-				let metadata = file.metadata().await?;
-				if metadata.is_dir() {
-					return Ok(PeerRes::Error("Cannot read directory".into()));
-				}
-				let file_len = metadata.len();
-				if offset >= file_len {
-					return Ok(PeerRes::FileChunk(FileChunk {
-						offset,
-						data: Vec::new(),
-						eof: true,
-					}));
-				}
-				let remaining = file_len - offset;
-				let to_read = match length {
-					Some(l) => l.min(remaining),
-					None => remaining,
-				};
-				let mut reader = tokio::io::BufReader::new(file);
-				reader.seek(std::io::SeekFrom::Start(offset)).await?;
-				let mut buffer = vec![0u8; to_read as usize];
-				let n = reader.read(&mut buffer).await?;
-				buffer.truncate(n);
-				let eof = offset + n as u64 >= file_len;
-				PeerRes::FileChunk(FileChunk {
-					offset,
-					data: buffer,
-					eof,
-				})
-			}
-			PeerReq::WriteFile { path, offset, data } => {
-				// Open (or create) file with write capability
-				let mut file = match fs::OpenOptions::new()
-					.create(true)
-					.write(true)
-					.read(true)
-					.open(&path)
-					.await
-				{
-					Ok(f) => f,
-					Err(e) => return Ok(PeerRes::Error(format!("open failed: {}", e))),
-				};
-				// Ensure we don't overflow length when extending
-				let current_len = match file.metadata().await {
-					Ok(m) => m.len(),
-					Err(e) => return Ok(PeerRes::Error(format!("metadata failed: {}", e))),
-				};
-				let required_len = match offset.checked_add(data.len() as u64) {
-					Some(v) => v,
-					None => return Ok(PeerRes::Error("length overflow".into())),
-				};
-				if required_len > current_len {
-					if let Err(e) = file.set_len(required_len).await {
-						return Ok(PeerRes::Error(format!("set_len failed: {}", e)));
-					}
-				}
-				if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
-					return Ok(PeerRes::Error(format!("seek failed: {}", e)));
-				}
-				if let Err(e) = file.write_all(&data).await {
-					return Ok(PeerRes::Error(format!("write failed: {}", e)));
-				}
-				PeerRes::WriteAck(FileWriteAck {
-					bytes_written: data.len() as u64,
-				})
-			}
+			PeerReq::ReadFile {path, offset, length } => PeerRes::FileChunk(read_file(&path, offset, length).await?),
+			PeerReq::WriteFile { path, offset, data } => PeerRes::WriteAck(write_file(&path, offset, &data).await?),
 			PeerReq::ListCpus => {
 				let cpus = self.collect_cpu_info();
 				PeerRes::Cpus(cpus)
@@ -543,31 +549,13 @@ impl App {
 					log::error!("dial failed: {err}");
 				}
 			}
-			Command::ListDir { path, tx } => {
-				let result = Self::collect_dir_entries(&path).await;
-				if tx.send(result).is_err() {
-					log::warn!("ListDir response receiver dropped for path {path}");
-				}
-			}
-			Command::FetchDir { peer, path, tx } => {
+			Command::ListDir { peer, path, tx } => {
 				let request_id = self
 					.swarm
 					.behaviour_mut()
 					.puppypeer
 					.send_request(&peer, PeerReq::ListDir { path: path.clone() });
-				if let Some(prev) = self
-					.pending_requests
-					.insert(request_id, PendingRequest::DirEntries(tx))
-				{
-					match prev {
-						PendingRequest::DirEntries(tx) => {
-							let _ = tx.send(Err(anyhow!("request superseded")));
-						}
-						PendingRequest::Cpus(tx) => {
-							let _ = tx.send(Err(anyhow!("request superseded")));
-						}
-					}
-				}
+				if let Some(prev) = self.pending_requests.insert(request_id, PendingRequest::DirEntries(tx));
 			}
 			Command::ListCpus { tx, peer_id } => {
 				if self.state.lock().unwrap().me == peer_id {
@@ -580,19 +568,19 @@ impl App {
 					.behaviour_mut()
 					.puppypeer
 					.send_request(&peer_id, PeerReq::ListCpus);
-				if let Some(prev) = self
-					.pending_requests
-					.insert(request_id, PendingRequest::Cpus(tx))
-				{
-					match prev {
-						PendingRequest::DirEntries(tx) => {
-							let _ = tx.send(Err(anyhow!("request superseded")));
-						}
-						PendingRequest::Cpus(tx) => {
-							let _ = tx.send(Err(anyhow!("request superseded")));
-						}
-					}
+				self.pending_requests.insert(request_id, PendingRequest::Cpus(tx));
+			}
+			Command::ReadFile(req) => {
+				if self.state.lock().unwrap().me == req.peer_id {
+					let chunk = read_file(&req.path, req.offset, None).await;
+					let _ = req.tx.send(chunk.map(|c| c.data));
+					return;
 				}
+				let request_id = self.swarm.behaviour_mut().puppypeer.send_request(
+					&req.peer_id,
+					PeerReq::ReadFile { path: req.path.clone(), offset: req.offset, length: req.length },
+				);
+				self.pending_requests.insert(request_id, PendingRequest::ReadFile(req.tx));
 			}
 		}
 	}
@@ -650,28 +638,11 @@ impl PuppyPeer {
 		self.state.clone()
 	}
 
-	pub async fn list_dir(&self, path: impl Into<String>) -> Result<Vec<DirEntry>> {
+	pub async fn list_dir(&self, peer: PeerId, path: impl Into<String>) -> Result<Vec<DirEntry>> {
 		let path = path.into();
 		let (tx, rx) = oneshot::channel();
-		self.cmd_tx
-			.send(Command::ListDir { path, tx })
-			.map_err(|e| anyhow!("failed to send ListDir command: {e}"))?;
-		rx.await
-			.map_err(|e| anyhow!("ListDir response channel closed: {e}"))?
-	}
-
-	pub async fn list_cpus(&self, peer_id: PeerId) -> Result<Vec<CpuInfo>> {
-		let (tx, rx) = oneshot::channel();
-		self.cmd_tx
-			.send(Command::ListCpus { tx, peer_id })
-			.map_err(|e| anyhow!("failed to send ListCpus command: {e}"))?;
-		rx.await
-			.map_err(|e| anyhow!("ListCpus response channel closed: {e}"))?
-	}
-
-	pub fn list_cpus_blocking(&self, peer_id: PeerId) -> Result<Vec<CpuInfo>> {
-		let cpus = block_on(self.list_cpus(peer_id));
-		cpus
+		self.cmd_tx.send(Command::ListDir { peer, path, tx }).map_err(|e| anyhow!("failed to send ListDir command: {e}"))?;
+		rx.await.map_err(|e| anyhow!("ListDir response channel closed: {e}"))?
 	}
 
 	pub fn list_dir_blocking(&self, path: impl Into<String>) -> Result<Vec<DirEntry>> {
@@ -690,6 +661,20 @@ impl PuppyPeer {
 		})
 	}
 
+	pub async fn list_cpus(&self, peer_id: PeerId) -> Result<Vec<CpuInfo>> {
+		let (tx, rx) = oneshot::channel();
+		self.cmd_tx
+			.send(Command::ListCpus { tx, peer_id })
+			.map_err(|e| anyhow!("failed to send ListCpus command: {e}"))?;
+		rx.await
+			.map_err(|e| anyhow!("ListCpus response channel closed: {e}"))?
+	}
+
+	pub fn list_cpus_blocking(&self, peer_id: PeerId) -> Result<Vec<CpuInfo>> {
+		let cpus = block_on(self.list_cpus(peer_id));
+		cpus
+	}
+
 	pub async fn list_dir_remote(
 		&self,
 		peer: libp2p::PeerId,
@@ -698,7 +683,7 @@ impl PuppyPeer {
 		let path = path.into();
 		let (tx, rx) = oneshot::channel();
 		self.cmd_tx
-			.send(Command::FetchDir { peer, path, tx })
+			.send(Command::ListDir { peer, path, tx })
 			.map_err(|e| anyhow!("failed to send FetchDir command: {e}"))?;
 		rx.await
 			.map_err(|e| anyhow!("FetchDir response channel closed: {e}"))?
@@ -716,7 +701,7 @@ impl PuppyPeer {
 			handle.block_on(async move {
 				let (tx, rx) = oneshot::channel();
 				sender
-					.send(Command::FetchDir { peer, path, tx })
+					.send(Command::ListDir { peer, path, tx })
 					.map_err(|e| anyhow!("failed to send FetchDir command: {e}"))?;
 				rx.await
 					.map_err(|e| anyhow!("FetchDir response channel closed: {e}"))?
