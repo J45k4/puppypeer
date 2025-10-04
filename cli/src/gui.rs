@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::mem;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,10 +12,11 @@ use iced::widget::{button, container, scrollable, text, text_input, tooltip, pic
 use iced::{Application, Command, Element, Length, Settings, Subscription, Theme};
 use libp2p::PeerId;
 use puppyagent_core::p2p::{CpuInfo, DirEntry};
-use puppyagent_core::{PuppyPeer, State};
+use puppyagent_core::{FileChunk, PuppyPeer, State};
 
 const LOCAL_LISTEN_MULTIADDR: &str = "/ip4/0.0.0.0:8336";
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const FILE_VIEW_CHUNK_SIZE: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum MenuItem {
@@ -76,6 +78,49 @@ impl FileBrowserState {
 			loading: true,
 			error: None,
 		}
+	}
+}
+
+#[derive(Debug, Clone)]
+struct FileViewerState {
+	browser: FileBrowserState,
+	peer_id: String,
+	path: String,
+	data: Vec<u8>,
+	offset: u64,
+	eof: bool,
+	loading: bool,
+	error: Option<String>,
+}
+
+impl FileViewerState {
+	fn new(browser: FileBrowserState, peer_id: String, path: String) -> Self {
+		Self {
+			peer_id,
+			path,
+			browser,
+			data: Vec::new(),
+			offset: 0,
+			eof: false,
+			loading: true,
+			error: None,
+		}
+	}
+
+	fn apply_chunk(&mut self, chunk: FileChunk) {
+		let offset = chunk.offset;
+		let eof = chunk.eof;
+		let data = chunk.data;
+		if offset != self.offset {
+			self.offset = offset;
+		}
+		if !data.is_empty() {
+			self.offset = offset.saturating_add(data.len() as u64);
+			self.data.extend_from_slice(&data);
+		} else {
+			self.offset = offset;
+		}
+		self.eof = eof;
 	}
 }
 
@@ -206,6 +251,7 @@ enum Mode {
 	PeerActions { peer_id: String },
 	PeerCpus(PeerCpuState),
 	FileBrowser(FileBrowserState),
+	FileViewer(FileViewerState),
 	PeersGraph,
 	CreateUser(CreateUserForm),
 	FileSearch(FileSearchState),
@@ -230,6 +276,14 @@ pub enum GuiMessage {
 	},
 	FileEntryActivated(DirEntry),
 	FileNavigateUp,
+	FileReadLoaded {
+		peer_id: String,
+		path: String,
+		offset: u64,
+		result: Result<FileChunk, String>,
+	},
+	FileReadMore,
+	FileViewerBack,
 	GraphNext,
 	GraphPrev,
 	UsernameChanged(String),
@@ -421,8 +475,38 @@ impl Application for GuiApp {
 							},
 						);
 					}
-					self.status =
-						format!("Selected file {} ({})", entry.name, format_size(entry.size),);
+					let target = join_child_path(&state.path, &entry.name);
+					let peer_id = state.peer_id.clone();
+					let browser_snapshot = state.clone();
+					self.status = format!(
+						"Reading {} ({})",
+						target,
+						format_size(entry.size)
+					);
+					let peer = self.peer.clone();
+					let local = self.local_peer_id.clone();
+					let command = Command::perform(
+						fetch_file_chunk(
+							peer,
+							local,
+							peer_id.clone(),
+							target.clone(),
+							0,
+							FILE_VIEW_CHUNK_SIZE,
+						),
+						|(peer_id, path, offset, result)| GuiMessage::FileReadLoaded {
+							peer_id,
+							path,
+							offset,
+							result,
+						},
+					);
+					self.mode = Mode::FileViewer(FileViewerState::new(
+						browser_snapshot,
+						peer_id,
+						target,
+					));
+					return command;
 				}
 				Command::none()
 			}
@@ -449,6 +533,78 @@ impl Application for GuiApp {
 							entries,
 						},
 					);
+				}
+				Command::none()
+			}
+			GuiMessage::FileReadLoaded {
+				peer_id,
+				path,
+				offset: _,
+				result,
+			} => {
+				match &mut self.mode {
+					Mode::FileViewer(state) if state.peer_id == peer_id && state.path == path => {
+						state.loading = false;
+						match result {
+							Ok(chunk) => {
+								state.error = None;
+								state.apply_chunk(chunk);
+								self.status = format!(
+									"Loaded {} bytes{}",
+									state.data.len(),
+									if state.eof { " (end of file)" } else { "" }
+								);
+							}
+							Err(err) => {
+								state.error = Some(err.clone());
+								self.status = format!("Failed to load file chunk: {}", err);
+							}
+						}
+					}
+					_ => {}
+				}
+				Command::none()
+			}
+			GuiMessage::FileReadMore => {
+				if let Mode::FileViewer(state) = &mut self.mode {
+					if state.loading {
+						return Command::none();
+					}
+					if state.eof {
+						self.status = String::from("Already at end of file");
+						return Command::none();
+					}
+					state.loading = true;
+					let peer_id = state.peer_id.clone();
+					let path = state.path.clone();
+					let offset = state.offset;
+					self.status = format!("Loading bytes starting at {}...", offset);
+					let peer = self.peer.clone();
+					let local = self.local_peer_id.clone();
+					return Command::perform(
+						fetch_file_chunk(
+							peer,
+							local,
+							peer_id,
+							path,
+							offset,
+							FILE_VIEW_CHUNK_SIZE,
+						),
+						|(peer_id, path, offset, result)| GuiMessage::FileReadLoaded {
+							peer_id,
+							path,
+							offset,
+							result,
+						},
+					);
+				}
+				Command::none()
+			}
+			GuiMessage::FileViewerBack => {
+				if let Mode::FileViewer(state) = mem::replace(&mut self.mode, Mode::Peers) {
+					let browser = state.browser;
+					self.status = format!("Browsing {} on {}", browser.path, browser.peer_id);
+					self.mode = Mode::FileBrowser(browser);
 				}
 				Command::none()
 			}
@@ -550,6 +706,7 @@ impl Application for GuiApp {
 			Mode::PeerActions { peer_id } => self.view_peer_actions(peer_id),
 			Mode::PeerCpus(state) => self.view_peer_cpus(state),
 			Mode::FileBrowser(state) => self.view_file_browser(state),
+			Mode::FileViewer(state) => self.view_file_viewer(state),
 			Mode::PeersGraph => self.view_graph(),
 			Mode::CreateUser(form) => self.view_create_user(form),
 			Mode::FileSearch(state) => self.view_file_search(state),
@@ -784,6 +941,53 @@ impl GuiApp {
 		layout.into()
 	}
 
+	fn view_file_viewer(&self, state: &FileViewerState) -> Element<'_, GuiMessage> {
+		let mut layout = iced::widget::Column::new().spacing(12);
+		layout = layout.push(text(format!("Viewing {} on {}", state.path, state.peer_id)).size(24));
+		let mut summary = format!("Loaded {} bytes", state.data.len());
+		if state.eof {
+			summary.push_str(" (end of file)");
+		}
+		layout = layout.push(text(summary).size(14));
+		if let Some(err) = &state.error {
+			layout = layout.push(text(format!("Error: {}", err)).size(14));
+		}
+		if !state.data.is_empty() {
+			let (preview, lossy) = file_preview_text(&state.data);
+			let mut preview_column = iced::widget::Column::new().spacing(4);
+			if lossy {
+				preview_column = preview_column.push(text("Binary data - non UTF-8 bytes replaced").size(12));
+			}
+			preview_column = preview_column.push(text(preview).size(14).width(Length::Fill));
+			layout = layout.push(
+				scrollable(
+					container(preview_column)
+						.padding(8)
+						.style(theme::Container::Box),
+				)
+				.height(Length::Fill),
+			);
+		} else if state.loading {
+			layout = layout.push(text("Loading file chunk...").size(14));
+		} else if state.eof {
+			layout = layout.push(text("File is empty").size(14));
+		} else {
+			layout = layout.push(text("No data loaded yet").size(14));
+		}
+		let mut controls = iced::widget::Row::new().spacing(12);
+		if !state.eof {
+			let label = if state.loading { "Loading..." } else { "Load more" };
+			let mut load_btn = button(text(label));
+			if !state.loading {
+				load_btn = load_btn.on_press(GuiMessage::FileReadMore);
+			}
+			controls = controls.push(load_btn);
+		}
+		controls = controls.push(button(text("Back to browser")).on_press(GuiMessage::FileViewerBack));
+		layout = layout.push(controls);
+		layout.into()
+	}
+
 	fn view_graph(&self) -> Element<'_, GuiMessage> {
 		let mut layout = iced::widget::Column::new().spacing(12);
 		layout = layout.push(text("Peers Graph Overview").size(24));
@@ -989,6 +1193,13 @@ fn format_size(bytes: u64) -> String {
 	}
 }
 
+fn file_preview_text(data: &[u8]) -> (String, bool) {
+	match std::str::from_utf8(data) {
+		Ok(text) => (text.to_string(), false),
+		Err(_) => (String::from_utf8_lossy(data).to_string(), true),
+	}
+}
+
 fn abbreviate_peer_id(id: &str) -> String {
 	const PREFIX: usize = 8;
 	const SUFFIX: usize = 6;
@@ -1051,7 +1262,7 @@ async fn fetch_dir_entries(
 ) -> (String, String, Result<Vec<DirEntry>, String>) {
 	let path_clone = path.clone();
 	let result = if local_peer_id.as_deref() == Some(peer_id.as_str()) {
-		peer.list_dir(path_clone)
+		peer.list_dir_local(path_clone)
 			.await
 			.map_err(|err| err.to_string())
 	} else {
@@ -1064,6 +1275,32 @@ async fn fetch_dir_entries(
 		}
 	};
 	(peer_id, path, result)
+}
+
+async fn fetch_file_chunk(
+	peer: Arc<PuppyPeer>,
+	local_peer_id: Option<String>,
+	peer_id: String,
+	path: String,
+	offset: u64,
+	length: u64,
+) -> (String, String, u64, Result<FileChunk, String>) {
+	let path_clone = path.clone();
+	let result = if local_peer_id.as_deref() == Some(peer_id.as_str()) {
+		peer
+			.read_file_local(path_clone, offset, Some(length))
+			.await
+			.map_err(|err| err.to_string())
+	} else {
+		match PeerId::from_str(&peer_id) {
+			Ok(target) => peer
+				.read_file_remote(target, path_clone, offset, Some(length))
+				.await
+				.map_err(|err| err.to_string()),
+			Err(err) => Err(err.to_string()),
+		}
+	};
+	(peer_id, path, offset, result)
 }
 
 async fn search_files(

@@ -1,6 +1,7 @@
 use crate::p2p::{
-	AuthMethod, CpuInfo, DirEntry, FileChunk, FileWriteAck, InterfaceInfo, PeerReq, PeerRes,
+	AuthMethod, CpuInfo, DirEntry, FileWriteAck, InterfaceInfo, PeerReq, PeerRes,
 };
+use crate::types::FileChunk;
 use crate::{
 	p2p::{AgentBehaviour, AgentEvent, build_swarm, load_or_generate_keypair},
 	state::{Connection, State},
@@ -16,7 +17,6 @@ use std::{env, path::Path};
 use sysinfo::{Networks, System};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::task::block_in_place;
 use tokio::{
 	sync::{
 		mpsc::{UnboundedReceiver, UnboundedSender},
@@ -32,7 +32,7 @@ pub struct ReadFileCmd {
 	path: String,
 	offset: u64,
 	length: Option<u64>,
-	tx: oneshot::Sender<Result<Vec<u8>>>,
+	tx: oneshot::Sender<Result<FileChunk>>,
 }
 
 pub enum Command {
@@ -60,11 +60,11 @@ async fn read_file(path: &str, offset: u64, length: Option<u64>) -> Result<FileC
 	}
 	let file_len = metadata.len();
 	if offset >= file_len {
-		return Ok(PeerRes::FileChunk(FileChunk {
+		return Ok(FileChunk {
 			offset,
 			data: Vec::new(),
 			eof: true,
-		}));
+		});
 	}
 	let remaining = file_len - offset;
 	let to_read = match length {
@@ -129,11 +129,67 @@ pub struct App {
 	system: System,
 }
 
-enum PendingRequest {
-	DirEntries(oneshot::Sender<Result<Vec<DirEntry>>>),
-	Cpus(oneshot::Sender<Result<Vec<CpuInfo>>>),
-	ReadFile(oneshot::Sender<FileChunk>)
+trait ResponseDecoder: Sized + Send + 'static {
+	fn decode(response: PeerRes) -> anyhow::Result<Self>;
 }
+
+impl ResponseDecoder for Vec<DirEntry> {
+	fn decode(response: PeerRes) -> anyhow::Result<Self> {
+		match response {
+			PeerRes::DirEntries(entries) => Ok(entries),
+			other => Err(anyhow!("unexpected response: {:?}", other)),
+		}
+	}
+}
+
+impl ResponseDecoder for Vec<CpuInfo> {
+	fn decode(response: PeerRes) -> anyhow::Result<Self> {
+		match response {
+			PeerRes::Cpus(cpus) => Ok(cpus),
+			other => Err(anyhow!("unexpected response: {:?}", other)),
+		}
+	}
+}
+
+impl ResponseDecoder for FileChunk {
+	fn decode(response: PeerRes) -> anyhow::Result<Self> {
+		match response {
+			PeerRes::FileChunk(chunk) => Ok(chunk),
+			other => Err(anyhow!("unexpected response: {:?}", other)),
+		}
+	}
+}
+
+trait PendingResponseHandler: Send {
+	fn complete(self: Box<Self>, response: PeerRes);
+	fn fail(self: Box<Self>, error: anyhow::Error);
+}
+
+struct Pending<T: ResponseDecoder> {
+	tx: oneshot::Sender<Result<T>>,
+}
+
+impl<T: ResponseDecoder> Pending<T> {
+	fn new(tx: oneshot::Sender<Result<T>>) -> PendingRequest {
+		Box::new(Self { tx })
+	}
+}
+
+impl<T: ResponseDecoder> PendingResponseHandler for Pending<T> {
+	fn complete(self: Box<Self>, response: PeerRes) {
+		let result = match response {
+			PeerRes::Error(err) => Err(anyhow!(err)),
+			other => T::decode(other),
+		};
+		let _ = self.tx.send(result);
+	}
+
+	fn fail(self: Box<Self>, error: anyhow::Error) {
+		let _ = self.tx.send(Err(error));
+	}
+}
+
+type PendingRequest = Box<dyn PendingResponseHandler>;
 
 impl App {
 	pub fn new(state: Arc<Mutex<State>>) -> (Self, tokio::sync::mpsc::UnboundedSender<Command>) {
@@ -367,35 +423,7 @@ impl App {
 								response,
 							} => {
 								if let Some(pending) = self.pending_requests.remove(&request_id) {
-									match (pending, response) {
-										(
-											PendingRequest::DirEntries(tx),
-											PeerRes::DirEntries(entries),
-										) => {
-											let _ = tx.send(Ok(entries));
-										}
-										(PendingRequest::Cpus(tx), PeerRes::Cpus(cpus)) => {
-											let _ = tx.send(Ok(cpus));
-										}
-										(PendingRequest::DirEntries(tx), PeerRes::Error(err)) => {
-											let _ = tx.send(Err(anyhow!(err)));
-										}
-										(PendingRequest::Cpus(tx), PeerRes::Error(err)) => {
-											let _ = tx.send(Err(anyhow!(err)));
-										}
-										(PendingRequest::DirEntries(tx), other) => {
-											let _ = tx.send(Err(anyhow!(
-												"unexpected response: {:?}",
-												other
-											)));
-										}
-										(PendingRequest::Cpus(tx), other) => {
-											let _ = tx.send(Err(anyhow!(
-												"unexpected response: {:?}",
-												other
-											)));
-										}
-									}
+									pending.complete(response);
 								}
 							}
 						}
@@ -408,14 +436,7 @@ impl App {
 					} => {
 						log::warn!("outbound request to {} failed: {error}", peer);
 						if let Some(pending) = self.pending_requests.remove(&request_id) {
-							match pending {
-								PendingRequest::DirEntries(tx) => {
-									let _ = tx.send(Err(anyhow!("request failed: {error}")));
-								}
-								PendingRequest::Cpus(tx) => {
-									let _ = tx.send(Err(anyhow!("request failed: {error}")));
-								}
-							}
+							pending.fail(anyhow!("request failed: {error}"));
 						}
 					}
 					libp2p::request_response::Event::InboundFailure {
@@ -550,12 +571,25 @@ impl App {
 				}
 			}
 			Command::ListDir { peer, path, tx } => {
+				let is_self = {
+					self.state.lock().map(|state| state.me == peer).unwrap_or(false)
+				};
+				if is_self {
+					let result = Self::collect_dir_entries(&path).await;
+					let _ = tx.send(result);
+					return;
+				}
 				let request_id = self
 					.swarm
 					.behaviour_mut()
 					.puppypeer
 					.send_request(&peer, PeerReq::ListDir { path: path.clone() });
-				if let Some(prev) = self.pending_requests.insert(request_id, PendingRequest::DirEntries(tx));
+				if let Some(prev) = self
+					.pending_requests
+					.insert(request_id, Pending::<Vec<DirEntry>>::new(tx))
+				{
+					prev.fail(anyhow!("pending ListDir request was replaced"));
+				}
 			}
 			Command::ListCpus { tx, peer_id } => {
 				if self.state.lock().unwrap().me == peer_id {
@@ -568,19 +602,23 @@ impl App {
 					.behaviour_mut()
 					.puppypeer
 					.send_request(&peer_id, PeerReq::ListCpus);
-				self.pending_requests.insert(request_id, PendingRequest::Cpus(tx));
+				self
+					.pending_requests
+					.insert(request_id, Pending::<Vec<CpuInfo>>::new(tx));
 			}
 			Command::ReadFile(req) => {
 				if self.state.lock().unwrap().me == req.peer_id {
-					let chunk = read_file(&req.path, req.offset, None).await;
-					let _ = req.tx.send(chunk.map(|c| c.data));
+					let chunk = read_file(&req.path, req.offset, req.length).await;
+					let _ = req.tx.send(chunk);
 					return;
 				}
 				let request_id = self.swarm.behaviour_mut().puppypeer.send_request(
 					&req.peer_id,
 					PeerReq::ReadFile { path: req.path.clone(), offset: req.offset, length: req.length },
 				);
-				self.pending_requests.insert(request_id, PendingRequest::ReadFile(req.tx));
+				self
+					.pending_requests
+					.insert(request_id, Pending::<FileChunk>::new(req.tx));
 			}
 		}
 	}
@@ -645,15 +683,28 @@ impl PuppyPeer {
 		rx.await.map_err(|e| anyhow!("ListDir response channel closed: {e}"))?
 	}
 
+	pub async fn list_dir_local(&self, path: impl Into<String>) -> Result<Vec<DirEntry>> {
+		let peer = {
+			let state = self.state.lock().unwrap();
+			state.me
+		};
+		self.list_dir(peer, path).await
+	}
+
 	pub fn list_dir_blocking(&self, path: impl Into<String>) -> Result<Vec<DirEntry>> {
 		let sender = self.cmd_tx.clone();
+		let state = self.state.clone();
 		let path = path.into();
 		let handle = tokio::runtime::Handle::current();
 		task::block_in_place(move || {
+			let peer = {
+				let state = state.lock().unwrap();
+				state.me
+			};
 			handle.block_on(async move {
 				let (tx, rx) = oneshot::channel();
 				sender
-					.send(Command::ListDir { path, tx })
+					.send(Command::ListDir { peer, path, tx })
 					.map_err(|e| anyhow!("failed to send ListDir command: {e}"))?;
 				rx.await
 					.map_err(|e| anyhow!("ListDir response channel closed: {e}"))?
@@ -707,6 +758,51 @@ impl PuppyPeer {
 					.map_err(|e| anyhow!("FetchDir response channel closed: {e}"))?
 			})
 		})
+	}
+
+	pub async fn read_file(
+		&self,
+		peer: libp2p::PeerId,
+		path: impl Into<String>,
+		offset: u64,
+		length: Option<u64>,
+	) -> Result<FileChunk> {
+		let path = path.into();
+		let (tx, rx) = oneshot::channel();
+		self
+			.cmd_tx
+			.send(Command::ReadFile(ReadFileCmd {
+				peer_id: peer,
+				path,
+				offset,
+				length,
+				tx,
+			}))
+			.map_err(|e| anyhow!("failed to send ReadFile command: {e}"))?;
+		rx.await.map_err(|e| anyhow!("ReadFile response channel closed: {e}"))?
+	}
+
+	pub async fn read_file_local(
+		&self,
+		path: impl Into<String>,
+		offset: u64,
+		length: Option<u64>,
+	) -> Result<FileChunk> {
+		let peer = {
+			let state = self.state.lock().unwrap();
+			state.me
+		};
+		self.read_file(peer, path, offset, length).await
+	}
+
+	pub async fn read_file_remote(
+		&self,
+		peer: libp2p::PeerId,
+		path: impl Into<String>,
+		offset: u64,
+		length: Option<u64>,
+	) -> Result<FileChunk> {
+		self.read_file(peer, path, offset, length).await
 	}
 
 	/// Wait for the peer until Ctrl+C (SIGINT) then perform a graceful shutdown.

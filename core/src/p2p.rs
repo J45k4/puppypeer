@@ -155,7 +155,7 @@ pub struct CpuInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DiskInfo {
+pub struct DiskInfo {
 	name: String,
 	mount_path: String,
 	filesystem: String,
