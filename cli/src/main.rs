@@ -1,7 +1,6 @@
 use args::Command;
 use clap::Parser;
-use puppypeer_core::{PuppyPeer, wait_group::WaitGroup};
-use uuid::Uuid;
+use puppypeer_core::{PuppyPeer};
 
 mod args;
 mod gui;
@@ -15,6 +14,14 @@ mod utility;
 #[tokio::main]
 async fn main() {
 	let args = args::Args::parse();
+	let init_logging = match &args.command {
+		Some(Command::Tui) | Some(Command::Gui) => false,
+		_ => true,
+	};
+	if init_logging {
+		simple_logger::init_with_level(log::Level::Info).unwrap();
+	}
+
 	let version_label = utility::get_version_label().unwrap_or("dev");
 	log::info!("puppyagent version {}", version_label);
 
@@ -22,11 +29,6 @@ async fn main() {
 	log::info!("rayon enabled");
 	#[cfg(feature = "ring")]
 	log::info!("ring enabled");
-
-	// Placeholder: node_id generated; database disabled
-	let _node_id = *Uuid::new_v4().as_bytes();
-
-	let _wg = WaitGroup::new();
 
 	match args.command {
 		Some(command) => match command {
@@ -74,7 +76,6 @@ async fn main() {
 			}
 		},
 		None => {
-			simple_logger::init_with_level(log::Level::Info).unwrap();
 			let peer = PuppyPeer::new();
 			peer.wait().await;
 			return;
