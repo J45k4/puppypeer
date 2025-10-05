@@ -12,7 +12,7 @@ simple_logger = "5"
 ratatui = "0.27"
 crossterm = "0.27"
 puppyagent_core = { path = "../core" }
-iced = { version = "0.12", features = ["tokio"] }
+iced = { version = "0.12", features = ["tokio", "image"] }
 # Optional dependencies gated by features
 sha2 = { version = "0.10", features = ["oid"], optional = true }
 rsa = { version = "0.9", default-features = false, features = ["sha2", "pem"], optional = true }

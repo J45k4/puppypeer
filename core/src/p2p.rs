@@ -26,6 +26,7 @@ use tokio::sync::Mutex;
 use tokio::time::{Duration, interval};
 use uuid::Uuid;
 
+use crate::types::FileChunk;
 use crate::wait_group::WaitGroupGuard;
 
 const PUPPYPEER_PROTOCOL: &str = "/puppypeer/0.0.1";
@@ -85,6 +86,7 @@ pub enum PeerReq {
 	RevokeUser {
 		username: String,
 	},
+	
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,18 +134,14 @@ pub struct DirEntry {
 	pub name: String,
 	pub is_dir: bool,
 	pub extension: Option<String>,
+	pub mime: Option<String>,
 	pub size: u64,
 	pub created_at: Option<DateTime<Utc>>,
 	pub modified_at: Option<DateTime<Utc>>,
 	pub accessed_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileChunk {
-	pub offset: u64,
-	pub data: Vec<u8>,
-	pub eof: bool,
-}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileWriteAck {
@@ -158,7 +156,7 @@ pub struct CpuInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DiskInfo {
+pub struct DiskInfo {
 	name: String,
 	mount_path: String,
 	filesystem: String,

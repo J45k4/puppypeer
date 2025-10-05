@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::types::Context;
-use puppyagent_core::{p2p, wait_group::WaitGroup};
+use puppyagent_core::wait_group::WaitGroup;
 
 pub async fn start(ctx: Arc<Context>, binds: Vec<String>, peers: Vec<String>, wg: WaitGroup) {
 	// {
