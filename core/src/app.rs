@@ -700,33 +700,8 @@ impl PuppyPeer {
 		rx.await.map_err(|e| anyhow!("ListDir response channel closed: {e}"))?
 	}
 
-	pub async fn list_dir_local(&self, path: impl Into<String>) -> Result<Vec<DirEntry>> {
-		let peer = {
-			let state = self.state.lock().unwrap();
-			state.me
-		};
-		self.list_dir(peer, path).await
-	}
-
-	pub fn list_dir_blocking(&self, path: impl Into<String>) -> Result<Vec<DirEntry>> {
-		let sender = self.cmd_tx.clone();
-		let state = self.state.clone();
-		let path = path.into();
-		let handle = tokio::runtime::Handle::current();
-		task::block_in_place(move || {
-			let peer = {
-				let state = state.lock().unwrap();
-				state.me
-			};
-			handle.block_on(async move {
-				let (tx, rx) = oneshot::channel();
-				sender
-					.send(Command::ListDir { peer, path, tx })
-					.map_err(|e| anyhow!("failed to send ListDir command: {e}"))?;
-				rx.await
-					.map_err(|e| anyhow!("ListDir response channel closed: {e}"))?
-			})
-		})
+	pub fn list_dir_blocking(&self, peer: PeerId, path: impl Into<String>) -> Result<Vec<DirEntry>> {
+		block_on(self.list_dir(peer, path))
 	}
 
 	pub async fn list_cpus(&self, peer_id: PeerId) -> Result<Vec<CpuInfo>> {
@@ -739,42 +714,7 @@ impl PuppyPeer {
 	}
 
 	pub fn list_cpus_blocking(&self, peer_id: PeerId) -> Result<Vec<CpuInfo>> {
-		let cpus = block_on(self.list_cpus(peer_id));
-		cpus
-	}
-
-	pub async fn list_dir_remote(
-		&self,
-		peer: libp2p::PeerId,
-		path: impl Into<String>,
-	) -> Result<Vec<DirEntry>> {
-		let path = path.into();
-		let (tx, rx) = oneshot::channel();
-		self.cmd_tx
-			.send(Command::ListDir { peer, path, tx })
-			.map_err(|e| anyhow!("failed to send FetchDir command: {e}"))?;
-		rx.await
-			.map_err(|e| anyhow!("FetchDir response channel closed: {e}"))?
-	}
-
-	pub fn list_dir_remote_blocking(
-		&self,
-		peer: libp2p::PeerId,
-		path: impl Into<String>,
-	) -> Result<Vec<DirEntry>> {
-		let sender = self.cmd_tx.clone();
-		let path = path.into();
-		let handle = tokio::runtime::Handle::current();
-		task::block_in_place(move || {
-			handle.block_on(async move {
-				let (tx, rx) = oneshot::channel();
-				sender
-					.send(Command::ListDir { peer, path, tx })
-					.map_err(|e| anyhow!("failed to send FetchDir command: {e}"))?;
-				rx.await
-					.map_err(|e| anyhow!("FetchDir response channel closed: {e}"))?
-			})
-		})
+		block_on(self.list_cpus(peer_id))
 	}
 
 	pub async fn read_file(
@@ -799,27 +739,14 @@ impl PuppyPeer {
 		rx.await.map_err(|e| anyhow!("ReadFile response channel closed: {e}"))?
 	}
 
-	pub async fn read_file_local(
-		&self,
-		path: impl Into<String>,
-		offset: u64,
-		length: Option<u64>,
-	) -> Result<FileChunk> {
-		let peer = {
-			let state = self.state.lock().unwrap();
-			state.me
-		};
-		self.read_file(peer, path, offset, length).await
-	}
-
-	pub async fn read_file_remote(
+	pub fn read_file_blocking(
 		&self,
 		peer: libp2p::PeerId,
 		path: impl Into<String>,
 		offset: u64,
 		length: Option<u64>,
 	) -> Result<FileChunk> {
-		self.read_file(peer, path, offset, length).await
+		block_on(self.read_file(peer, path, offset, length))
 	}
 
 	/// Wait for the peer until Ctrl+C (SIGINT) then perform a graceful shutdown.

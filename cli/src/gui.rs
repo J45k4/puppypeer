@@ -1,9 +1,10 @@
 use std::collections::HashMap;
-use std::mem;
+use std::{any, mem};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use iced::alignment::{Horizontal, Vertical};
 use iced::executor;
 use iced::theme;
@@ -244,6 +245,22 @@ impl FileSearchState {
 	}
 }
 
+fn map_result<T>(result: anyhow::Result<T, anyhow::Error>) -> Result<T, String> {
+	result.map_err(|err| format!("{err}"))
+}
+
+async fn list_dir(peer: Arc<PuppyPeer>, peer_id: String, path: String) -> (String, String, Result<Vec<DirEntry>, String>) {
+	let target = PeerId::from_str(&peer_id).unwrap();
+	let result = peer.list_dir(target, path.clone()).await;
+	(peer_id, path, map_result(result))
+}
+
+async fn read_file(peer: Arc<PuppyPeer>, peer_id: String, path: String, offset: u64) -> (String, String, u64, Result<FileChunk, String>) {
+	let target = PeerId::from_str(&peer_id).unwrap();
+	let result = peer.read_file(target, path.clone(), offset, Some(FILE_VIEW_CHUNK_SIZE)).await;
+	(peer_id, path, offset, map_result(result))
+}
+
 pub struct GuiApp {
 	peer: Arc<PuppyPeer>,
 	latest_state: Option<State>,
@@ -429,9 +446,8 @@ impl Application for GuiApp {
 				self.status = format!("Listing {} on {}...", path, peer_id);
 				self.mode = Mode::FileBrowser(FileBrowserState::new(peer_id.clone(), path.clone()));
 				let peer = self.peer.clone();
-				let local = self.local_peer_id.clone();
 				Command::perform(
-					fetch_dir_entries(peer, local, peer_id, path),
+					list_dir(peer, peer_id.parse().unwrap(), path),
 					|(peer_id, path, entries)| GuiMessage::FileBrowserLoaded {
 						peer_id,
 						path,
@@ -478,7 +494,7 @@ impl Application for GuiApp {
 						let peer = self.peer.clone();
 						let local = self.local_peer_id.clone();
 						return Command::perform(
-							fetch_dir_entries(peer, local, peer_id, target),
+							list_dir(peer, peer_id.parse().unwrap(), target),
 							|(peer_id, path, entries)| GuiMessage::FileBrowserLoaded {
 								peer_id,
 								path,
@@ -499,14 +515,7 @@ impl Application for GuiApp {
 					let peer = self.peer.clone();
 					let local = self.local_peer_id.clone();
 					let command = Command::perform(
-						fetch_file_chunk(
-							peer,
-							local,
-							peer_id.clone(),
-							target.clone(),
-							0,
-							FILE_VIEW_CHUNK_SIZE,
-						),
+						read_file(peer, peer_id.clone(), target.clone(), 0),
 						|(peer_id, path, offset, result)| GuiMessage::FileReadLoaded {
 							peer_id,
 							path,
@@ -540,7 +549,7 @@ impl Application for GuiApp {
 					let peer = self.peer.clone();
 					let local = self.local_peer_id.clone();
 					return Command::perform(
-						fetch_dir_entries(peer, local, peer_id, target),
+						list_dir(peer, peer_id.parse().unwrap(), target),
 						|(peer_id, path, entries)| GuiMessage::FileBrowserLoaded {
 							peer_id,
 							path,
@@ -607,14 +616,7 @@ impl Application for GuiApp {
 					let peer = self.peer.clone();
 					let local = self.local_peer_id.clone();
 					return Command::perform(
-						fetch_file_chunk(
-							peer,
-							local,
-							peer_id,
-							path,
-							offset,
-							FILE_VIEW_CHUNK_SIZE,
-						),
+						read_file(peer, peer_id, path.clone(), offset),
 						|(peer_id, path, offset, result)| GuiMessage::FileReadLoaded {
 							peer_id,
 							path,
@@ -1302,55 +1304,6 @@ async fn fetch_cpus(
 		Err(err) => Err(err.to_string()),
 	};
 	(peer_id, result)
-}
-
-async fn fetch_dir_entries(
-	peer: Arc<PuppyPeer>,
-	local_peer_id: Option<String>,
-	peer_id: String,
-	path: String,
-) -> (String, String, Result<Vec<DirEntry>, String>) {
-	let path_clone = path.clone();
-	let result = if local_peer_id.as_deref() == Some(peer_id.as_str()) {
-		peer.list_dir_local(path_clone)
-			.await
-			.map_err(|err| err.to_string())
-	} else {
-		match PeerId::from_str(&peer_id) {
-			Ok(target) => peer
-				.list_dir_remote(target, path_clone)
-				.await
-				.map_err(|err| err.to_string()),
-			Err(err) => Err(err.to_string()),
-		}
-	};
-	(peer_id, path, result)
-}
-
-async fn fetch_file_chunk(
-	peer: Arc<PuppyPeer>,
-	local_peer_id: Option<String>,
-	peer_id: String,
-	path: String,
-	offset: u64,
-	length: u64,
-) -> (String, String, u64, Result<FileChunk, String>) {
-	let path_clone = path.clone();
-	let result = if local_peer_id.as_deref() == Some(peer_id.as_str()) {
-		peer
-			.read_file_local(path_clone, offset, Some(length))
-			.await
-			.map_err(|err| err.to_string())
-	} else {
-		match PeerId::from_str(&peer_id) {
-			Ok(target) => peer
-				.read_file_remote(target, path_clone, offset, Some(length))
-				.await
-				.map_err(|err| err.to_string()),
-			Err(err) => Err(err.to_string()),
-		}
-	};
-	(peer_id, path, offset, result)
 }
 
 async fn search_files(

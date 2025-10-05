@@ -622,12 +622,12 @@ impl ShellApp {
 							if entry.is_dir {
 								let peer_id = view.peer_id.clone();
 								let target = join_child_path(&view.path, &entry.name);
-								match Self::fetch_dir_entries(&self.peer, &peer_id, &target) {
+								match self.peer.list_dir_blocking(peer_id.parse().unwrap(), target.clone()) {
 									Ok(entries) => {
 										view.replace_entries(target.clone(), entries);
 										self.status_line =
-											format!("Browsing {} on {}", target, peer_id);
-									}
+												format!("Browsing {} on {}", target, peer_id);
+										}
 									Err(err) => {
 										self.status_line =
 											format!("Failed to open {}: {}", target, err);
@@ -646,7 +646,7 @@ impl ShellApp {
 						let parent = parent_path(&view.path);
 						if parent != view.path {
 							let peer_id = view.peer_id.clone();
-							match Self::fetch_dir_entries(&self.peer, &peer_id, &parent) {
+							match self.peer.list_dir_blocking(peer_id.parse().unwrap(), parent.clone()) {
 								Ok(entries) => {
 									view.replace_entries(parent.clone(), entries);
 									self.status_line =
@@ -747,27 +747,13 @@ impl ShellApp {
 	}
 
 	fn create_file_browser_view(&self, peer_id: String, path: &str) -> Result<FileBrowserView> {
-		let local_id = self.latest_state.as_ref().map(|s| format!("{}", s.me));
-		let entries = if local_id.as_deref() == Some(peer_id.as_str()) {
-			self.peer
-				.list_dir_blocking(path.to_string())
-				.with_context(|| format!("listing {} locally", path))?
-		} else {
-			Self::fetch_dir_entries(&self.peer, &peer_id, path)?
-		};
+		let entries = self.peer.list_dir_blocking(peer_id.parse()?, path.to_string()).with_context(|| format!("listing {} locally", path))?;
 		Ok(FileBrowserView::new(peer_id, path.to_string(), entries))
 	}
 
 	fn create_cpu_view(&self, peer_id: String) -> Result<PeerCpuView> {
 		let cpus = self.peer.list_cpus_blocking(peer_id.parse()?)?;
 		Ok(PeerCpuView::new(peer_id, cpus))
-	}
-
-	fn fetch_dir_entries(peer: &PuppyPeer, peer_id: &str, path: &str) -> Result<Vec<DirEntry>> {
-		let target =
-			PeerId::from_str(peer_id).with_context(|| format!("invalid peer id {peer_id}"))?;
-		peer.list_dir_remote_blocking(target, path.to_string())
-			.with_context(|| format!("listing {} on {}", path, peer_id))
 	}
 
 	// fn fetch_remote_cpus(peer: &PuppyPeer, peer_id: &str) -> Result<Vec<CpuInfo>> {
