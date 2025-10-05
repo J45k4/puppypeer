@@ -19,7 +19,6 @@ use puppypeer_core::{FileChunk, PuppyPeer, State};
 const LOCAL_LISTEN_MULTIADDR: &str = "/ip4/0.0.0.0:8336";
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const FILE_VIEW_CHUNK_SIZE: u64 = 64 * 1024;
-const APP_TITLE: &str = concat!("PuppyAgent GUI v", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum MenuItem {
@@ -272,6 +271,7 @@ pub struct GuiApp {
 	selected_peer_id: Option<String>,
 	graph: GraphView,
 	status: String,
+	app_title: String,
 }
 
 #[derive(Debug, Clone)]
@@ -329,9 +329,9 @@ impl Application for GuiApp {
 	type Executor = executor::Default;
 	type Message = GuiMessage;
 	type Theme = Theme;
-	type Flags = ();
+	type Flags = String;
 
-	fn new(_flags: Self::Flags) -> (Self, Command<Self::Message>) {
+	fn new(flags: Self::Flags) -> (Self, Command<Self::Message>) {
 		let peer = Arc::new(PuppyPeer::new());
 		let latest_state = peer.state().lock().ok().map(|state| state.clone());
 		let peers = latest_state
@@ -350,12 +350,13 @@ impl Application for GuiApp {
 			selected_peer_id: None,
 			graph,
 			status: String::from("Ready"),
+			app_title: flags,
 		};
 		(app, Command::none())
 	}
 
 	fn title(&self) -> String {
-		APP_TITLE.to_string()
+		self.app_title.clone()
 	}
 
 	fn theme(&self) -> Theme {
@@ -1339,9 +1340,10 @@ async fn search_files(
 	Ok((Vec::new(), Vec::new()))
 }
 
-pub fn run() -> iced::Result {
+pub fn run(app_title: String) -> iced::Result {
 	let mut settings = Settings::default();
 	settings.window.size = iced::Size::new(1024.0, 720.0);
+	settings.flags = app_title;
 	GuiApp::run(settings)
 }
 
@@ -1363,7 +1365,7 @@ mod tests {
 	#[test]
 	fn selecting_peers_refreshes_from_state() {
 		with_runtime(|| {
-			let (mut app, _) = GuiApp::new(());
+		let (mut app, _) = GuiApp::new(String::from("Test Title"));
 			let new_peer = PeerId::random();
 			{
 				let state = app.peer.state();
@@ -1381,7 +1383,7 @@ mod tests {
 	#[test]
 	fn selecting_graph_rebuilds_nodes() {
 		with_runtime(|| {
-			let (mut app, _) = GuiApp::new(());
+		let (mut app, _) = GuiApp::new(String::from("Test Title"));
 			let new_peer = PeerId::random();
 			{
 				let state = app.peer.state();

@@ -61,7 +61,8 @@ async fn main() {
 				return;
 			}
 			Command::Gui => {
-				if let Err(err) = gui::run() {
+				let app_title = format!("PuppyAgent GUI v{}", version_label);
+				if let Err(err) = gui::run(app_title) {
 					log::error!("gui error: {err:?}");
 					std::process::exit(1);
 				}
