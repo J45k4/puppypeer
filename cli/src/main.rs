@@ -1,6 +1,6 @@
 use args::Command;
 use clap::Parser;
-use puppyagent_core::{PuppyPeer, wait_group::WaitGroup};
+use puppypeer_core::{PuppyPeer, wait_group::WaitGroup};
 use uuid::Uuid;
 
 mod args;

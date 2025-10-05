@@ -11,7 +11,7 @@ use crossterm::{
 	terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use libp2p::PeerId;
-use puppyagent_core::{
+use puppypeer_core::{
 	PuppyPeer, State,
 	p2p::{CpuInfo, DirEntry},
 };

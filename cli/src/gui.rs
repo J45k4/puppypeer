@@ -13,12 +13,13 @@ use iced::widget::{button, container, pick_list, scrollable, text, text_input, t
 use iced::widget::image::Handle as ImageHandle;
 use iced::{Application, Command, Element, Length, Settings, Subscription, Theme};
 use libp2p::PeerId;
-use puppyagent_core::p2p::{CpuInfo, DirEntry};
-use puppyagent_core::{FileChunk, PuppyPeer, State};
+use puppypeer_core::p2p::{CpuInfo, DirEntry};
+use puppypeer_core::{FileChunk, PuppyPeer, State};
 
 const LOCAL_LISTEN_MULTIADDR: &str = "/ip4/0.0.0.0:8336";
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const FILE_VIEW_CHUNK_SIZE: u64 = 64 * 1024;
+const APP_TITLE: &str = concat!("PuppyAgent GUI v", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum MenuItem {
@@ -354,7 +355,7 @@ impl Application for GuiApp {
 	}
 
 	fn title(&self) -> String {
-		String::from("PuppyAgent GUI")
+		APP_TITLE.to_string()
 	}
 
 	fn theme(&self) -> Theme {
