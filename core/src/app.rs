@@ -229,7 +229,6 @@ impl App {
 	}
 
 	async fn handle_puppy_peer_req(&mut self, req: PeerReq) -> anyhow::Result<PeerRes> {
-		log::info!("Received PeerReq: {:?}", req);
 		let res = match req {
 			PeerReq::ListDir { path } => {
 				let entries = Self::collect_dir_entries(&path).await?;
@@ -496,7 +495,6 @@ impl App {
 	}
 
 	async fn handle_swarm_event(&mut self, event: SwarmEvent<AgentEvent>) {
-		log::info!("SwarmEvent: {:?}", event);
 		match event {
 			SwarmEvent::Behaviour(b) => self.handle_agent_event(b).await,
 			SwarmEvent::ConnectionEstablished {

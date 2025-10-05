@@ -565,27 +565,49 @@ impl Application for GuiApp {
 				offset: _,
 				result,
 			} => {
+				let mut next_command = Command::none();
 				match &mut self.mode {
 					Mode::FileViewer(state) if state.peer_id == peer_id && state.path == path => {
 						state.loading = false;
 						match result {
 							Ok(chunk) => {
+								let prev_offset = state.offset;
+								let chunk_len = chunk.data.len();
 								state.error = None;
 								state.apply_chunk(chunk);
 								let mime_label = state.mime.clone().unwrap_or_else(|| String::from("?"));
-								if state.is_image() && state.eof && !state.data.is_empty() {
-									self.status = format!(
-										"Image loaded: {} bytes | {}",
-										state.data.len(),
-										mime_label,
-									);
+								let base_status = if state.is_image() && state.eof && !state.data.is_empty() {
+									format!("Image loaded: {} bytes | {}", state.data.len(), mime_label)
 								} else {
 									let eof_note = if state.eof { " (end of file)" } else { "" };
+									format!("Loaded {} bytes{} | {}", state.data.len(), eof_note, mime_label)
+								};
+								let progressed = state.offset > prev_offset;
+								if state.eof {
+									self.status = base_status;
+								} else if progressed {
+									self.status = format!("{}; fetching more...", base_status);
+									state.loading = true;
+									let peer_id = state.peer_id.clone();
+									let path = state.path.clone();
+									let offset = state.offset;
+									let peer = self.peer.clone();
+									next_command = Command::perform(
+										read_file(peer, peer_id.clone(), path.clone(), offset),
+										|(peer_id, path, offset, result)| GuiMessage::FileReadLoaded {
+											peer_id,
+											path,
+											offset,
+											result,
+										},
+									);
+								} else {
+									// No progress in this chunk; leave loading stopped for manual retry.
 									self.status = format!(
-										"Loaded {} bytes{} | {}",
-										state.data.len(),
-										eof_note,
-										mime_label,
+										"{}; waiting for more data at offset {} (received {} bytes)",
+										base_status,
+										state.offset,
+										chunk_len,
 									);
 								}
 							}
@@ -597,7 +619,7 @@ impl Application for GuiApp {
 					}
 					_ => {}
 				}
-				Command::none()
+				next_command
 			}
 			GuiMessage::FileReadMore => {
 				if let Mode::FileViewer(state) = &mut self.mode {
@@ -712,7 +734,6 @@ impl Application for GuiApp {
 	}
 
 	fn view(&self) -> Element<'_, Self::Message> {
-		println!("mode: {:?}", self.mode);
 		let mut menu_column = iced::widget::Column::new().spacing(8);
 		for item in MENU_ITEMS.iter() {
 			let mut label = item.label().to_string();
@@ -804,7 +825,6 @@ impl GuiApp {
 	}
 
 	fn view_peers(&self) -> Element<'_, GuiMessage> {
-		println!("view_peers");
 		let mut layout = iced::widget::Column::new().spacing(12);
 		layout = layout.push(text("Discovered Peers").size(24));
 		if self.peers.is_empty() {
