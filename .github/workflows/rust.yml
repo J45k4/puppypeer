@@ -1,0 +1,133 @@
+name: Rust CI/CD
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - '*'
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: write
+
+env:
+  PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+  VERSION: ${{ github.ref_name }}
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: Cache Cargo registry
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+      - name: Cache Cargo build
+        uses: actions/cache@v3
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+      - name: Format Check
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace
+      - name: Test
+        run: cargo test --release
+      - name: Build
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: cargo build --release -p puppypeer
+
+      - name: Sign Binary (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $Env:PRIVATE_KEY | Out-File -FilePath private_key.pem -Encoding ASCII
+          openssl dgst -sha256 -sign private_key.pem -out target\release\puppypeer.sig target\release\puppypeer.exe
+          Remove-Item private_key.pem
+      - name: Sign Binary (Unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          echo "$PRIVATE_KEY" > private_key.pem
+          openssl dgst -sha256 -sign private_key.pem -out target/release/puppypeer.sig target/release/puppypeer
+          rm private_key.pem
+      - name: Package Binary (Windows)
+        if: matrix.os == 'windows-latest'
+        id: package_windows
+        shell: pwsh
+        run: |
+          $binaryName = "puppypeer.exe"
+          $archiveName = "$($binaryName)-${{ github.ref_name }}-windows.zip"
+          Compress-Archive -Path "target\release\$binaryName","target\release\puppypeer.sig" -DestinationPath "$archiveName"
+          echo "artifact_name=$archiveName" >> $env:GITHUB_OUTPUT
+      - name: Package Binary (Unix)
+        if: matrix.os != 'windows-latest'
+        id: package_unix
+        run: |
+          if [[ "${{ matrix.os }}" == "macos-latest" ]]; then
+            ARCHIVE_SUFFIX="macos.tar.gz"
+          else
+            ARCHIVE_SUFFIX="linux.tar.gz"
+          fi
+          BINARY_NAME="puppypeer"
+          ARCHIVE_NAME="$BINARY_NAME-${{ github.ref_name }}-$ARCHIVE_SUFFIX"
+          # Include puppypeer and puppypeer.sig in the archive
+          tar -czf "$ARCHIVE_NAME" -C target/release "$BINARY_NAME" "puppypeer.sig"
+          echo "artifact_name=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
+      - name: Upload Artifact (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: ${{ steps.package_windows.outputs.artifact_name }}
+      - name: Upload Artifact (Unix)
+        if: matrix.os != 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}
+          path: ${{ steps.package_unix.outputs.artifact_name }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+      - name: Create GitHub Release
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          files: artifacts/**
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
