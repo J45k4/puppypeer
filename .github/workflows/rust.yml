@@ -16,7 +16,6 @@ permissions:
 env:
   PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
   VERSION: ${{ github.ref_name }}
-  SANITIZED_VERSION: ${{ replace(github.ref_name, '/', '-') }}
 
 jobs:
   build:
@@ -76,14 +75,19 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/') && matrix.os == 'windows-latest'
         id: package_windows
         shell: pwsh
+        env:
+          TAG_NAME: ${{ github.ref_name }}
         run: |
           $binaryName = "puppypeer.exe"
-          $archiveName = "${binaryName}-$env:SANITIZED_VERSION-windows.zip"
+          $archiveVersion = $env:TAG_NAME -replace '/', '-'
+          $archiveName = "${binaryName}-$archiveVersion-windows.zip"
           Compress-Archive -Path "target\release\$binaryName","target\release\puppypeer.sig" -DestinationPath "$archiveName"
           echo "artifact_name=$archiveName" >> $env:GITHUB_OUTPUT
       - name: Package Binary (Unix)
         if: startsWith(github.ref, 'refs/tags/') && matrix.os != 'windows-latest'
         id: package_unix
+        env:
+          TAG_NAME: ${{ github.ref_name }}
         run: |
           if [[ "${{ matrix.os }}" == "macos-latest" ]]; then
             ARCHIVE_SUFFIX="macos.tar.gz"
@@ -91,7 +95,8 @@ jobs:
             ARCHIVE_SUFFIX="linux.tar.gz"
           fi
           BINARY_NAME="puppypeer"
-          ARCHIVE_NAME="$BINARY_NAME-$SANITIZED_VERSION-$ARCHIVE_SUFFIX"
+          TAG_SAFE="${TAG_NAME//\//-}"
+          ARCHIVE_NAME="$BINARY_NAME-$TAG_SAFE-$ARCHIVE_SUFFIX"
           # Include puppypeer and puppypeer.sig in the archive
           tar -czf "$ARCHIVE_NAME" -C target/release "$BINARY_NAME" "puppypeer.sig"
           echo "artifact_name=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
