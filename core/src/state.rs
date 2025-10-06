@@ -1,5 +1,6 @@
 use anyhow::bail;
 use libp2p::{Multiaddr, PeerId, swarm::ConnectionId};
+use std::path::{Path, PathBuf};
 
 pub const FLAG_READ: u8 = 0x01;
 pub const FLAG_WRITE: u8 = 0x02;
@@ -8,13 +9,17 @@ pub const FLAG_SEARCH: u8 = 0x08;
 
 #[derive(Clone, Debug)]
 pub struct FolderRule {
-	path: String,
+	path: PathBuf,
 	flags: u8,
 }
 
 impl FolderRule {
-	pub fn new(path: String, flags: u8) -> Self {
+	pub fn new(path: PathBuf, flags: u8) -> Self {
 		Self { path, flags }
+	}
+
+	pub fn path(&self) -> &Path {
+		&self.path
 	}
 
 	pub fn can_read(&self) -> bool {
@@ -27,6 +32,26 @@ impl FolderRule {
 
 	pub fn can_execute(&self) -> bool {
 		self.flags & FLAG_EXECUTE != 0
+	}
+
+	pub fn can_search(&self) -> bool {
+		self.flags & FLAG_SEARCH != 0
+	}
+
+	pub fn allows(&self, access: u8) -> bool {
+		if access & FLAG_READ != 0 && !self.can_read() {
+			return false;
+		}
+		if access & FLAG_WRITE != 0 && !self.can_write() {
+			return false;
+		}
+		if access & FLAG_EXECUTE != 0 && !self.can_execute() {
+			return false;
+		}
+		if access & FLAG_SEARCH != 0 && !self.can_search() {
+			return false;
+		}
+		true
 	}
 }
 
@@ -99,6 +124,7 @@ pub struct State {
 	pub discovered_peers: Vec<DiscoveredPeer>,
 	pub peers: Vec<Peer>,
 	pub users: Vec<User>,
+	pub shared_folders: Vec<FolderRule>,
 }
 
 impl Default for State {
@@ -111,6 +137,7 @@ impl Default for State {
 			discovered_peers: Vec::new(),
 			peers: Vec::new(),
 			users: Vec::new(),
+			shared_folders: Vec::new(),
 		}
 	}
 }
@@ -118,9 +145,19 @@ impl Default for State {
 impl State {
 	pub fn authenticate(&mut self, peer_id: PeerId, method: AuthMethod) {}
 
-	pub fn has_fs_access(&self, src: PeerId, path: &str, access: u8) -> bool {
+	pub fn add_shared_folder(&mut self, rule: FolderRule) {
+		self.shared_folders.push(rule);
+	}
+
+	pub fn has_fs_access(&self, src: PeerId, path: &Path, access: u8) -> bool {
 		if src == self.me {
 			return true;
+		}
+
+		for rule in &self.shared_folders {
+			if path.starts_with(rule.path()) && rule.allows(access) {
+				return true;
+			}
 		}
 
 		for rel in &self.relationships {
@@ -131,13 +168,8 @@ impl State {
 							return true;
 						}
 						Rule::Folder(folder_rule) => {
-							if path.starts_with(&folder_rule.path) {
-								if (access & FLAG_READ != 0 && folder_rule.can_read())
-									|| (access & FLAG_WRITE != 0 && folder_rule.can_write())
-									|| (access & FLAG_EXECUTE != 0 && folder_rule.can_execute())
-								{
-									return true;
-								}
+							if path.starts_with(folder_rule.path()) && folder_rule.allows(access) {
+								return true;
 							}
 						}
 					}

@@ -6,6 +6,10 @@ pub struct Args {
 	pub peer: Vec<String>,
 	#[clap(long)]
 	pub bind: Vec<String>,
+	#[clap(long = "read", value_name = "PATH")]
+	pub read: Vec<String>,
+	#[clap(long = "write", value_name = "PATH")]
+	pub write: Vec<String>,
 	#[clap(long, default_value = "127.0.0.1:8832")]
 	pub ui_bind: String,
 	#[clap(subcommand)]
