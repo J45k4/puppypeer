@@ -1,5 +1,6 @@
 use anyhow::bail;
 use libp2p::{Multiaddr, PeerId, swarm::ConnectionId};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub const FLAG_READ: u8 = 0x01;
@@ -7,7 +8,7 @@ pub const FLAG_WRITE: u8 = 0x02;
 pub const FLAG_EXECUTE: u8 = 0x04;
 pub const FLAG_SEARCH: u8 = 0x08;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct FolderRule {
 	path: PathBuf,
 	flags: u8,
@@ -55,23 +56,33 @@ impl FolderRule {
 	}
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum Rule {
 	Owner,
 	Folder(FolderRule),
 }
 
-#[derive(Clone, Debug)]
-pub struct RelationshipRule {
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Permission {
 	rule: Rule,
 	expires_at: Option<i64>,
+}
+
+impl Permission {
+	pub fn rule(&self) -> &Rule {
+		&self.rule
+	}
+
+	pub fn expires_at(&self) -> Option<i64> {
+		self.expires_at
+	}
 }
 
 #[derive(Clone, Debug)]
 pub struct Relationship {
 	src: PeerId,
 	target: PeerId,
-	rules: Vec<RelationshipRule>,
+	rules: Vec<Permission>,
 }
 
 pub struct TokenAuth {
@@ -147,6 +158,23 @@ impl State {
 
 	pub fn add_shared_folder(&mut self, rule: FolderRule) {
 		self.shared_folders.push(rule);
+	}
+
+	pub fn permissions_for_peer(&self, peer_id: &PeerId) -> Vec<Permission> {
+		let mut permissions: Vec<Permission> = self
+			.shared_folders
+			.iter()
+			.map(|rule| Permission {
+				rule: Rule::Folder(rule.clone()),
+				expires_at: None,
+			})
+			.collect();
+		for relationship in &self.relationships {
+			if relationship.src == *peer_id || relationship.target == *peer_id {
+				permissions.extend(relationship.rules.iter().cloned());
+			}
+		}
+		permissions
 	}
 
 	pub fn has_fs_access(&self, src: PeerId, path: &Path, access: u8) -> bool {

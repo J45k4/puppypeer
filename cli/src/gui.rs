@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::{any, mem};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use iced::widget::image::Handle as ImageHandle;
 use iced::{Application, Command, Element, Length, Settings, Subscription, Theme};
 use libp2p::PeerId;
 use puppypeer_core::p2p::{CpuInfo, DirEntry};
-use puppypeer_core::{FileChunk, PuppyPeer, State};
+use puppypeer_core::{FileChunk, Permission, PuppyPeer, Rule, State};
 
 const LOCAL_LISTEN_MULTIADDR: &str = "/ip4/0.0.0.0:8336";
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
@@ -69,6 +69,7 @@ struct FileBrowserState {
 	entries: Vec<DirEntry>,
 	loading: bool,
 	error: Option<String>,
+	available_roots: Vec<String>,
 }
 
 impl FileBrowserState {
@@ -79,6 +80,7 @@ impl FileBrowserState {
 			entries: Vec::new(),
 			loading: true,
 			error: None,
+			available_roots: Vec::new(),
 		}
 	}
 }
@@ -255,6 +257,15 @@ async fn list_dir(peer: Arc<PuppyPeer>, peer_id: String, path: String) -> (Strin
 	(peer_id, path, map_result(result))
 }
 
+async fn list_permissions(
+	peer: Arc<PuppyPeer>,
+	peer_id: String,
+) -> (String, Result<Vec<Permission>, String>) {
+	let target = PeerId::from_str(&peer_id).unwrap();
+	let result = peer.list_permissions(target).await;
+	(peer_id, map_result(result))
+}
+
 async fn read_file(peer: Arc<PuppyPeer>, peer_id: String, path: String, offset: u64) -> (String, String, u64, Result<FileChunk, String>) {
 	let target = PeerId::from_str(&peer_id).unwrap();
 	let result = peer.read_file(target, path.clone(), offset, Some(FILE_VIEW_CHUNK_SIZE)).await;
@@ -296,7 +307,10 @@ pub enum GuiMessage {
 	CpuLoaded(String, Result<Vec<CpuInfo>, String>),
 	FileBrowserRequested {
 		peer_id: String,
-		path: String,
+	},
+	FileBrowserPermissionsLoaded {
+		peer_id: String,
+		permissions: Result<Vec<Permission>, String>,
 	},
 	FileBrowserLoaded {
 		peer_id: String,
@@ -444,18 +458,68 @@ impl Application for GuiApp {
 				}
 				Command::none()
 			}
-			GuiMessage::FileBrowserRequested { peer_id, path } => {
-				self.status = format!("Listing {} on {}...", path, peer_id);
-				self.mode = Mode::FileBrowser(FileBrowserState::new(peer_id.clone(), path.clone()));
+			GuiMessage::FileBrowserRequested { peer_id } => {
+				self.status = format!("Fetching shared folders for {}...", peer_id);
+				self.mode = Mode::FileBrowser(FileBrowserState::new(peer_id.clone(), String::new()));
+				self.selected_peer_id = Some(peer_id.clone());
+				if let Mode::FileBrowser(state) = &mut self.mode {
+					state.entries.clear();
+					state.loading = true;
+					state.error = None;
+					state.available_roots.clear();
+				}
 				let peer = self.peer.clone();
 				Command::perform(
-					list_dir(peer, peer_id.parse().unwrap(), path),
-					|(peer_id, path, entries)| GuiMessage::FileBrowserLoaded {
+					list_permissions(peer, peer_id.clone()),
+					|(peer_id, permissions)| GuiMessage::FileBrowserPermissionsLoaded {
 						peer_id,
-						path,
-						entries,
+						permissions,
 					},
 				)
+			}
+			GuiMessage::FileBrowserPermissionsLoaded { peer_id, permissions } => {
+				match permissions {
+					Ok(perms) => {
+						let default_path = default_browser_path(&perms).unwrap_or_else(|| String::from("/"));
+						let list_path = default_path.clone();
+						let status_path = default_path.clone();
+						let roots = permissions_roots(&perms);
+						self.status = format!("Listing {} on {}...", status_path, peer_id);
+						match &mut self.mode {
+							Mode::FileBrowser(state) if state.peer_id == peer_id => {
+								state.path = default_path.clone();
+								state.available_roots = roots.clone();
+								state.entries.clear();
+								state.loading = true;
+								state.error = None;
+							}
+							_ => {
+								let mut state = FileBrowserState::new(peer_id.clone(), default_path.clone());
+								state.available_roots = roots.clone();
+								self.mode = Mode::FileBrowser(state);
+							}
+						}
+						let peer = self.peer.clone();
+						return Command::perform(
+							list_dir(peer, peer_id.clone(), list_path),
+							|(peer_id, path, entries)| GuiMessage::FileBrowserLoaded {
+								peer_id,
+								path,
+								entries,
+							},
+						);
+					}
+					Err(err) => {
+						self.status = format!("Failed to fetch permissions: {}", err);
+						if let Mode::FileBrowser(state) = &mut self.mode {
+							if state.peer_id == peer_id {
+								state.loading = false;
+								state.error = Some(err.clone());
+							}
+						}
+						return Command::none();
+					}
+				}
 			}
 			GuiMessage::FileBrowserLoaded {
 				peer_id,
@@ -537,6 +601,11 @@ impl Application for GuiApp {
 			}
 			GuiMessage::FileNavigateUp => {
 				if let Mode::FileBrowser(state) = &mut self.mode {
+					let current = normalize_path(&state.path);
+					if state.available_roots.iter().any(|root| root == &current) {
+						self.status = String::from("Already at shared root");
+						return Command::none();
+					}
 					let target = parent_path(&state.path);
 					if target == state.path {
 						self.status = String::from("Already at root");
@@ -896,7 +965,6 @@ impl GuiApp {
 				.push(
 					button(text("File browser")).on_press(GuiMessage::FileBrowserRequested {
 						peer_id: peer.id.clone(),
-						path: String::from("/"),
 					}),
 				)
 				.push(button(text("Back")).on_press(GuiMessage::BackToPeers));
@@ -1289,6 +1357,42 @@ fn abbreviate_hash(hash_hex: &str) -> String {
 	if hash_hex.len() <= PREFIX + SUFFIX + 1 { hash_hex.to_string() } else { format!("{}…{}", &hash_hex[..PREFIX], &hash_hex[hash_hex.len()-SUFFIX..]) }
 }
 
+fn normalize_path(path: &str) -> String {
+	let trimmed = path.trim();
+	if trimmed.is_empty() {
+		return String::from("/");
+	}
+	let without_slash = trimmed.trim_end_matches('/');
+	if without_slash.is_empty() {
+		String::from("/")
+	} else {
+		without_slash.to_string()
+	}
+}
+
+fn permissions_roots(permissions: &[Permission]) -> Vec<String> {
+	let mut roots: BTreeSet<String> = BTreeSet::new();
+	for permission in permissions {
+		if let Rule::Folder(rule) = permission.rule() {
+			let path = rule.path().to_string_lossy().to_string();
+			roots.insert(normalize_path(&path));
+		}
+	}
+	roots.into_iter().collect()
+}
+
+fn default_browser_path(permissions: &[Permission]) -> Option<String> {
+	permissions.iter().find_map(|permission| {
+		if let Rule::Folder(rule) = permission.rule() {
+			if rule.can_read() || rule.can_search() || rule.can_write() {
+				let path = rule.path().to_string_lossy().to_string();
+				return Some(normalize_path(&path));
+			}
+		}
+		None
+	})
+}
+
 fn join_child_path(base: &str, child: &str) -> String {
 	if base.is_empty() || base == "/" {
 		format!("/{}", child.trim_start_matches('/'))
@@ -1352,6 +1456,9 @@ mod tests {
 	use super::*;
 
 	use libp2p::PeerId;
+	use std::fs;
+	use std::path::{Path, PathBuf};
+	use std::time::{SystemTime, UNIX_EPOCH};
 
 	fn with_runtime<T>(test: impl FnOnce() -> T) -> T {
 		let runtime = tokio::runtime::Runtime::new().expect("runtime");
@@ -1362,10 +1469,42 @@ mod tests {
 		result
 	}
 
+	fn temporary_key_path(test: &str) -> PathBuf {
+		let mut path = std::env::temp_dir();
+		let unique = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.unwrap_or_default()
+			.as_nanos();
+		path.push(format!(
+			"puppypeer-test-{}-{}-{}.key",
+			test,
+			std::process::id(),
+			unique
+		));
+		if path.exists() {
+			let _ = fs::remove_file(&path);
+		}
+		path
+	}
+
+	fn set_keypair_var(path: &Path) {
+		unsafe {
+			std::env::set_var("KEYPAIR", path);
+		}
+	}
+
+	fn clear_keypair_var() {
+		unsafe {
+			std::env::remove_var("KEYPAIR");
+		}
+	}
+
 	#[test]
 	fn selecting_peers_refreshes_from_state() {
 		with_runtime(|| {
-		let (mut app, _) = GuiApp::new(String::from("Test Title"));
+			let key_path = temporary_key_path("refresh");
+			set_keypair_var(&key_path);
+			let (mut app, _) = GuiApp::new(String::from("Test Title"));
 			let new_peer = PeerId::random();
 			{
 				let state = app.peer.state();
@@ -1377,29 +1516,32 @@ mod tests {
 			assert!(matches!(app.mode, Mode::Peers));
 			assert!(app.peers.iter().any(|row| row.id == new_peer.to_string()));
 			assert!(app.status.contains("Showing peers"));
+			let _ = fs::remove_file(&key_path);
+			clear_keypair_var();
 		});
 	}
 
 	#[test]
 	fn selecting_graph_rebuilds_nodes() {
 		with_runtime(|| {
-		let (mut app, _) = GuiApp::new(String::from("Test Title"));
-			let new_peer = PeerId::random();
+			let key_path = temporary_key_path("graph");
+			set_keypair_var(&key_path);
+			let (mut app, _) = GuiApp::new(String::from("Test Title"));
+			let peer_a = PeerId::random();
+			let peer_b = PeerId::random();
 			{
 				let state = app.peer.state();
 				let mut guard = state.lock().expect("state lock");
-				guard.peer_discovered(new_peer, "/ip4/127.0.0.1/tcp/8000".parse().unwrap());
+				guard.peer_discovered(peer_a, "/ip4/127.0.0.1/tcp/7001".parse().unwrap());
+				guard.peer_discovered(peer_b, "/ip4/127.0.0.1/tcp/7002".parse().unwrap());
 			}
 			app.graph.nodes.clear();
 			let _ = app.update(GuiMessage::MenuSelected(MenuItem::PeersGraph));
 			assert!(matches!(app.mode, Mode::PeersGraph));
-			assert!(
-				app.graph
-					.nodes
-					.iter()
-					.any(|node| node.id == new_peer.to_string())
-			);
+			assert_eq!(app.graph.nodes.len(), 3); // includes local peer
 			assert!(app.status.contains("Graph overview"));
+			let _ = fs::remove_file(&key_path);
+			clear_keypair_var();
 		});
 	}
 }

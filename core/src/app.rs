@@ -2,7 +2,7 @@ use crate::p2p::{AuthMethod, CpuInfo, DirEntry, FileWriteAck, InterfaceInfo, Pee
 use crate::types::FileChunk;
 use crate::{
 	p2p::{AgentBehaviour, AgentEvent, build_swarm, load_or_generate_keypair},
-	state::{Connection, FLAG_READ, FLAG_SEARCH, FLAG_WRITE, FolderRule, State},
+	state::{Connection, FLAG_READ, FLAG_SEARCH, FLAG_WRITE, FolderRule, Permission, State},
 };
 use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Utc};
@@ -49,6 +49,10 @@ pub enum Command {
 	ListCpus {
 		tx: oneshot::Sender<Result<Vec<CpuInfo>>>,
 		peer_id: PeerId,
+	},
+	ListPermissions {
+		peer: PeerId,
+		tx: oneshot::Sender<Result<Vec<Permission>>>,
 	},
 	ReadFile(ReadFileCmd),
 }
@@ -152,6 +156,15 @@ impl ResponseDecoder for Vec<CpuInfo> {
 	}
 }
 
+impl ResponseDecoder for Vec<Permission> {
+	fn decode(response: PeerRes) -> anyhow::Result<Self> {
+		match response {
+			PeerRes::Permissions(perms) => Ok(perms),
+			other => Err(anyhow!("unexpected response: {:?}", other)),
+		}
+	}
+}
+
 impl ResponseDecoder for FileChunk {
 	fn decode(response: PeerRes) -> anyhow::Result<Self> {
 		match response {
@@ -209,15 +222,22 @@ impl App {
 				key_path.display()
 			);
 		}
-		let id_keys = load_or_generate_keypair(key_path).unwrap();
+		let id_keys = load_or_generate_keypair(key_path).unwrap_or_else(|err| {
+			log::warn!(
+				"failed to load persisted keypair at {}: {err}; using ephemeral keypair",
+				key_path.display()
+			);
+			libp2p::identity::Keypair::generate_ed25519()
+		});
 		let peer_id = PeerId::from(id_keys.public());
 
 		let mut swarm = build_swarm(id_keys, peer_id).unwrap();
 		let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-		swarm
-			.listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
-			.unwrap();
+		let listen_addr = "/ip4/0.0.0.0/tcp/0".parse().unwrap();
+		if let Err(err) = swarm.listen_on(listen_addr) {
+			log::warn!("failed to start swarm listener: {err}");
+		}
 		{
 			if let Ok(mut s) = state.lock() {
 				s.me = peer_id;
@@ -242,6 +262,7 @@ impl App {
 	) -> anyhow::Result<PeerRes> {
 		let res = match req {
 			PeerReq::ListDir { path } => {
+				log::info!("[{}] ListDir {}", peer, path);
 				let canonical = match fs::canonicalize(&path).await {
 					Ok(p) => p,
 					Err(err) => {
@@ -261,6 +282,7 @@ impl App {
 				PeerRes::DirEntries(entries)
 			}
 			PeerReq::StatFile { path } => {
+				log::info!("[{}] StatFile {}", peer, path);
 				let canonical = match fs::canonicalize(&path).await {
 					Ok(p) => p,
 					Err(err) => {
@@ -312,6 +334,7 @@ impl App {
 				offset,
 				length,
 			} => {
+				log::info!("[{}] ReadFile {} (offset {}, length {:?})", peer, path, offset, length);
 				let canonical = match fs::canonicalize(&path).await {
 					Ok(p) => p,
 					Err(err) => {
@@ -326,6 +349,7 @@ impl App {
 				PeerRes::FileChunk(read_file(canonical.as_path(), offset, length).await?)
 			}
 			PeerReq::WriteFile { path, offset, data } => {
+				log::info!("[{}] WriteFile {} (offset {}, {} bytes)", peer, path, offset, data.len());
 				let requested_path = PathBuf::from(&path);
 				let canonical = match fs::metadata(&requested_path).await {
 					Ok(_) => match fs::canonicalize(&requested_path).await {
@@ -397,6 +421,17 @@ impl App {
 					})
 					.collect();
 				PeerRes::Interfaces(infos)
+			}
+			PeerReq::ListPermissions => {
+				log::info!("[{}] ListPermissions", peer);
+				let permissions = match self.state.lock() {
+					Ok(state) => state.permissions_for_peer(&peer),
+					Err(err) => {
+						log::error!("state lock poisoned while listing permissions: {}", err);
+						return Ok(PeerRes::Error("State unavailable".into()));
+					}
+				};
+				PeerRes::Permissions(permissions)
 			}
 			PeerReq::Authenticate { method } => match method {
 				AuthMethod::Token { token } => todo!(),
@@ -725,6 +760,36 @@ impl App {
 				self.pending_requests
 					.insert(request_id, Pending::<Vec<CpuInfo>>::new(tx));
 			}
+			Command::ListPermissions { peer, tx } => {
+				let local_permissions = match self.state.lock() {
+					Ok(state) => {
+						if state.me == peer {
+							Some(state.permissions_for_peer(&peer))
+						} else {
+							None
+						}
+					}
+					Err(err) => {
+						let _ = tx.send(Err(anyhow!("state lock poisoned: {}", err)));
+						return;
+					}
+				};
+				if let Some(permissions) = local_permissions {
+					let _ = tx.send(Ok(permissions));
+					return;
+				}
+				let request_id = self
+					.swarm
+					.behaviour_mut()
+					.puppypeer
+					.send_request(&peer, PeerReq::ListPermissions);
+				if let Some(prev) = self
+					.pending_requests
+					.insert(request_id, Pending::<Vec<Permission>>::new(tx))
+				{
+					prev.fail(anyhow!("pending ListPermissions request was replaced"));
+				}
+			}
 			Command::ReadFile(req) => {
 				if self.state.lock().unwrap().me == req.peer_id {
 					let chunk = read_file(Path::new(&req.path), req.offset, req.length).await;
@@ -848,6 +913,19 @@ impl PuppyPeer {
 
 	pub fn list_cpus_blocking(&self, peer_id: PeerId) -> Result<Vec<CpuInfo>> {
 		block_on(self.list_cpus(peer_id))
+	}
+
+	pub async fn list_permissions(&self, peer: PeerId) -> Result<Vec<Permission>> {
+		let (tx, rx) = oneshot::channel();
+		self.cmd_tx
+			.send(Command::ListPermissions { peer, tx })
+			.map_err(|e| anyhow!("failed to send ListPermissions command: {e}"))?;
+		rx.await
+			.map_err(|e| anyhow!("ListPermissions response channel closed: {e}"))?
+	}
+
+	pub fn list_permissions_blocking(&self, peer: PeerId) -> Result<Vec<Permission>> {
+		block_on(self.list_permissions(peer))
 	}
 
 	pub async fn read_file(

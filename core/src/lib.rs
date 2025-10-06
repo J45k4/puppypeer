@@ -4,7 +4,7 @@ mod types;
 pub mod p2p;
 pub mod scan;
 mod state;
-pub use state::State;
+pub use state::{FolderRule, Permission, Rule, State};
 pub use types::FileChunk;
 pub mod wait_group;
 pub use app::PuppyPeer;
