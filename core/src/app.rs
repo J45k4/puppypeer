@@ -1,20 +1,20 @@
-use crate::p2p::{
-	AuthMethod, CpuInfo, DirEntry, FileWriteAck, InterfaceInfo, PeerReq, PeerRes,
-};
+use crate::p2p::{AuthMethod, CpuInfo, DirEntry, FileWriteAck, InterfaceInfo, PeerReq, PeerRes};
 use crate::types::FileChunk;
 use crate::{
 	p2p::{AgentBehaviour, AgentEvent, build_swarm, load_or_generate_keypair},
-	state::{Connection, State},
+	state::{Connection, FLAG_READ, FLAG_SEARCH, FLAG_WRITE, FolderRule, Permission, State},
 };
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use futures::executor::block_on;
 use libp2p::{PeerId, Swarm, mdns, swarm::SwarmEvent};
-use mime_guess;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::{env, path::Path};
+use std::{
+	env,
+	path::{Path, PathBuf},
+};
 use sysinfo::{Networks, System};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -23,7 +23,7 @@ use tokio::{
 		mpsc::{UnboundedReceiver, UnboundedSender},
 		oneshot,
 	},
-	task::{self, JoinHandle},
+	task::JoinHandle,
 };
 
 use libp2p::request_response::OutboundRequestId;
@@ -50,11 +50,15 @@ pub enum Command {
 		tx: oneshot::Sender<Result<Vec<CpuInfo>>>,
 		peer_id: PeerId,
 	},
-	ReadFile(ReadFileCmd)
+	ListPermissions {
+		peer: PeerId,
+		tx: oneshot::Sender<Result<Vec<Permission>>>,
+	},
+	ReadFile(ReadFileCmd),
 }
 
-async fn read_file(path: &str, offset: u64, length: Option<u64>) -> Result<FileChunk> {
-	let file = fs::File::open(&path).await?;
+async fn read_file(path: &Path, offset: u64, length: Option<u64>) -> Result<FileChunk> {
+	let file = fs::File::open(path).await?;
 	let metadata = file.metadata().await?;
 	if metadata.is_dir() {
 		bail!("path is a directory")
@@ -85,13 +89,13 @@ async fn read_file(path: &str, offset: u64, length: Option<u64>) -> Result<FileC
 	})
 }
 
-async fn write_file(path: &str, offset: u64, data: &[u8]) -> Result<FileWriteAck> {
+async fn write_file(path: &Path, offset: u64, data: &[u8]) -> Result<FileWriteAck> {
 	// Open (or create) file with write capability
 	let mut file = match fs::OpenOptions::new()
 		.create(true)
 		.write(true)
 		.read(true)
-		.open(&path)
+		.open(path)
 		.await
 	{
 		Ok(f) => f,
@@ -152,6 +156,15 @@ impl ResponseDecoder for Vec<CpuInfo> {
 	}
 }
 
+impl ResponseDecoder for Vec<Permission> {
+	fn decode(response: PeerRes) -> anyhow::Result<Self> {
+		match response {
+			PeerRes::Permissions(perms) => Ok(perms),
+			other => Err(anyhow!("unexpected response: {:?}", other)),
+		}
+	}
+}
+
 impl ResponseDecoder for FileChunk {
 	fn decode(response: PeerRes) -> anyhow::Result<Self> {
 		match response {
@@ -193,6 +206,13 @@ impl<T: ResponseDecoder> PendingResponseHandler for Pending<T> {
 type PendingRequest = Box<dyn PendingResponseHandler>;
 
 impl App {
+	fn can_access(&self, peer: PeerId, path: &Path, access: u8) -> bool {
+		self.state
+			.lock()
+			.map(|state| state.has_fs_access(peer, path, access))
+			.unwrap_or(false)
+	}
+
 	pub fn new(state: Arc<Mutex<State>>) -> (Self, tokio::sync::mpsc::UnboundedSender<Command>) {
 		let key_path = env::var("KEYPAIR").unwrap_or_else(|_| String::from("peer_keypair.bin"));
 		let key_path = Path::new(&key_path);
@@ -202,15 +222,22 @@ impl App {
 				key_path.display()
 			);
 		}
-		let id_keys = load_or_generate_keypair(key_path).unwrap();
+		let id_keys = load_or_generate_keypair(key_path).unwrap_or_else(|err| {
+			log::warn!(
+				"failed to load persisted keypair at {}: {err}; using ephemeral keypair",
+				key_path.display()
+			);
+			libp2p::identity::Keypair::generate_ed25519()
+		});
 		let peer_id = PeerId::from(id_keys.public());
 
 		let mut swarm = build_swarm(id_keys, peer_id).unwrap();
 		let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-		swarm
-			.listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
-			.unwrap();
+		let listen_addr = "/ip4/0.0.0.0/tcp/0".parse().unwrap();
+		if let Err(err) = swarm.listen_on(listen_addr) {
+			log::warn!("failed to start swarm listener: {err}");
+		}
 		{
 			if let Ok(mut s) = state.lock() {
 				s.me = peer_id;
@@ -228,28 +255,59 @@ impl App {
 		)
 	}
 
-	async fn handle_puppy_peer_req(&mut self, req: PeerReq) -> anyhow::Result<PeerRes> {
+	async fn handle_puppy_peer_req(
+		&mut self,
+		peer: PeerId,
+		req: PeerReq,
+	) -> anyhow::Result<PeerRes> {
 		let res = match req {
 			PeerReq::ListDir { path } => {
-				let entries = Self::collect_dir_entries(&path).await?;
+				log::info!("[{}] ListDir {}", peer, path);
+				let canonical = match fs::canonicalize(&path).await {
+					Ok(p) => p,
+					Err(err) => {
+						log::warn!("failed to canonicalize directory {}: {err}", path);
+						return Ok(PeerRes::Error(format!("Failed to access directory: {err}")));
+					}
+				};
+				if !self.can_access(peer, &canonical, FLAG_READ | FLAG_SEARCH) {
+					log::warn!(
+						"peer {} denied directory listing for {}",
+						peer,
+						canonical.display()
+					);
+					return Ok(PeerRes::Error("Access denied".into()));
+				}
+				let entries = Self::collect_dir_entries(&canonical).await?;
 				PeerRes::DirEntries(entries)
 			}
 			PeerReq::StatFile { path } => {
-				let path = Path::new(&path);
-				let meta = fs::metadata(path).await?;
+				log::info!("[{}] StatFile {}", peer, path);
+				let canonical = match fs::canonicalize(&path).await {
+					Ok(p) => p,
+					Err(err) => {
+						log::warn!("failed to canonicalize file {}: {err}", path);
+						return Ok(PeerRes::Error(format!("Failed to access file: {err}")));
+					}
+				};
+				if !self.can_access(peer, &canonical, FLAG_READ | FLAG_SEARCH) {
+					log::warn!("peer {} denied stat for {}", peer, canonical.display());
+					return Ok(PeerRes::Error("Access denied".into()));
+				}
+				let meta = fs::metadata(&canonical).await?;
 				let file_type = meta.file_type();
-				let ext = path
+				let ext = canonical
 					.extension()
 					.and_then(|s| s.to_str().map(|s| s.to_string()));
 				let mime = if file_type.is_dir() {
 					None
 				} else {
-					mime_guess::from_path(path)
+					mime_guess::from_path(&canonical)
 						.first_raw()
 						.map(|value| value.to_string())
 				};
 				PeerRes::FileStat(DirEntry {
-					name: path
+					name: canonical
 						.file_name()
 						.and_then(|s| s.to_str().map(|s| s.to_string()))
 						.unwrap_or_default(),
@@ -271,8 +329,75 @@ impl App {
 						.and_then(|t| DateTime::<Utc>::from(t).into()),
 				})
 			}
-			PeerReq::ReadFile {path, offset, length } => PeerRes::FileChunk(read_file(&path, offset, length).await?),
-			PeerReq::WriteFile { path, offset, data } => PeerRes::WriteAck(write_file(&path, offset, &data).await?),
+			PeerReq::ReadFile {
+				path,
+				offset,
+				length,
+			} => {
+				log::info!("[{}] ReadFile {} (offset {}, length {:?})", peer, path, offset, length);
+				let canonical = match fs::canonicalize(&path).await {
+					Ok(p) => p,
+					Err(err) => {
+						log::warn!("failed to canonicalize read path {}: {err}", path);
+						return Ok(PeerRes::Error(format!("Failed to access file: {err}")));
+					}
+				};
+				if !self.can_access(peer, &canonical, FLAG_READ | FLAG_SEARCH) {
+					log::warn!("peer {} denied read for {}", peer, canonical.display());
+					return Ok(PeerRes::Error("Access denied".into()));
+				}
+				PeerRes::FileChunk(read_file(canonical.as_path(), offset, length).await?)
+			}
+			PeerReq::WriteFile { path, offset, data } => {
+				log::info!("[{}] WriteFile {} (offset {}, {} bytes)", peer, path, offset, data.len());
+				let requested_path = PathBuf::from(&path);
+				let canonical = match fs::metadata(&requested_path).await {
+					Ok(_) => match fs::canonicalize(&requested_path).await {
+						Ok(p) => p,
+						Err(err) => {
+							log::warn!("failed to canonicalize write path {}: {err}", path);
+							return Ok(PeerRes::Error(format!("Failed to access file: {err}")));
+						}
+					},
+					Err(_) => {
+						let parent = match requested_path.parent() {
+							Some(p) => p,
+							None => {
+								log::warn!("peer {} provided invalid write path {}", peer, path);
+								return Ok(PeerRes::Error("Invalid path".into()));
+							}
+						};
+						let canonical_parent = match fs::canonicalize(parent).await {
+							Ok(p) => p,
+							Err(err) => {
+								log::warn!(
+									"failed to canonicalize parent {} for write: {err}",
+									parent.display()
+								);
+								return Ok(PeerRes::Error(format!(
+									"Failed to access parent directory: {err}"
+								)));
+							}
+						};
+						match requested_path.file_name() {
+							Some(name) => canonical_parent.join(name),
+							None => {
+								log::warn!(
+									"peer {} provided invalid file name in path {}",
+									peer,
+									path
+								);
+								return Ok(PeerRes::Error("Invalid file name".into()));
+							}
+						}
+					}
+				};
+				if !self.can_access(peer, &canonical, FLAG_WRITE | FLAG_READ | FLAG_SEARCH) {
+					log::warn!("peer {} denied write for {}", peer, canonical.display());
+					return Ok(PeerRes::Error("Access denied".into()));
+				}
+				PeerRes::WriteAck(write_file(canonical.as_path(), offset, &data).await?)
+			}
 			PeerReq::ListCpus => {
 				let cpus = self.collect_cpu_info();
 				PeerRes::Cpus(cpus)
@@ -296,6 +421,17 @@ impl App {
 					})
 					.collect();
 				PeerRes::Interfaces(infos)
+			}
+			PeerReq::ListPermissions => {
+				log::info!("[{}] ListPermissions", peer);
+				let permissions = match self.state.lock() {
+					Ok(state) => state.permissions_for_peer(&peer),
+					Err(err) => {
+						log::error!("state lock poisoned while listing permissions: {}", err);
+						return Ok(PeerRes::Error("State unavailable".into()));
+					}
+				};
+				PeerRes::Permissions(permissions)
 			}
 			PeerReq::Authenticate { method } => match method {
 				AuthMethod::Token { token } => todo!(),
@@ -351,7 +487,8 @@ impl App {
 			.collect()
 	}
 
-	async fn collect_dir_entries(path: &str) -> Result<Vec<DirEntry>> {
+	async fn collect_dir_entries(path: impl AsRef<Path>) -> Result<Vec<DirEntry>> {
+		let path = path.as_ref();
 		let mut entries = Vec::new();
 		let mut reader = fs::read_dir(path).await?;
 		while let Some(entry) = reader.next_entry().await? {
@@ -410,7 +547,7 @@ impl App {
 			AgentEvent::PuppyPeer(event) => {
 				match event {
 					libp2p::request_response::Event::Message {
-						peer: _,
+						peer,
 						connection_id: _,
 						message,
 					} => {
@@ -420,7 +557,7 @@ impl App {
 								request,
 								channel,
 							} => {
-								if let Ok(res) = self.handle_puppy_peer_req(request).await {
+								if let Ok(res) = self.handle_puppy_peer_req(peer, request).await {
 									let _ = self
 										.swarm
 										.behaviour_mut()
@@ -587,10 +724,13 @@ impl App {
 			}
 			Command::ListDir { peer, path, tx } => {
 				let is_self = {
-					self.state.lock().map(|state| state.me == peer).unwrap_or(false)
+					self.state
+						.lock()
+						.map(|state| state.me == peer)
+						.unwrap_or(false)
 				};
 				if is_self {
-					let result = Self::collect_dir_entries(&path).await;
+					let result = Self::collect_dir_entries(Path::new(&path)).await;
 					let _ = tx.send(result);
 					return;
 				}
@@ -617,22 +757,54 @@ impl App {
 					.behaviour_mut()
 					.puppypeer
 					.send_request(&peer_id, PeerReq::ListCpus);
-				self
-					.pending_requests
+				self.pending_requests
 					.insert(request_id, Pending::<Vec<CpuInfo>>::new(tx));
+			}
+			Command::ListPermissions { peer, tx } => {
+				let local_permissions = match self.state.lock() {
+					Ok(state) => {
+						if state.me == peer {
+							Some(state.permissions_for_peer(&peer))
+						} else {
+							None
+						}
+					}
+					Err(err) => {
+						let _ = tx.send(Err(anyhow!("state lock poisoned: {}", err)));
+						return;
+					}
+				};
+				if let Some(permissions) = local_permissions {
+					let _ = tx.send(Ok(permissions));
+					return;
+				}
+				let request_id = self
+					.swarm
+					.behaviour_mut()
+					.puppypeer
+					.send_request(&peer, PeerReq::ListPermissions);
+				if let Some(prev) = self
+					.pending_requests
+					.insert(request_id, Pending::<Vec<Permission>>::new(tx))
+				{
+					prev.fail(anyhow!("pending ListPermissions request was replaced"));
+				}
 			}
 			Command::ReadFile(req) => {
 				if self.state.lock().unwrap().me == req.peer_id {
-					let chunk = read_file(&req.path, req.offset, req.length).await;
+					let chunk = read_file(Path::new(&req.path), req.offset, req.length).await;
 					let _ = req.tx.send(chunk);
 					return;
 				}
 				let request_id = self.swarm.behaviour_mut().puppypeer.send_request(
 					&req.peer_id,
-					PeerReq::ReadFile { path: req.path.clone(), offset: req.offset, length: req.length },
+					PeerReq::ReadFile {
+						path: req.path.clone(),
+						offset: req.offset,
+						length: req.length,
+					},
 				);
-				self
-					.pending_requests
+				self.pending_requests
 					.insert(request_id, Pending::<FileChunk>::new(req.tx));
 			}
 		}
@@ -687,6 +859,27 @@ impl PuppyPeer {
 		}
 	}
 
+	fn register_shared_folder(&self, path: PathBuf, flags: u8) -> anyhow::Result<()> {
+		let mut state = self
+			.state
+			.lock()
+			.map_err(|_| anyhow!("state lock poisoned"))?;
+		state.add_shared_folder(FolderRule::new(path, flags));
+		Ok(())
+	}
+
+	pub fn share_read_only_folder(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+		let canonical = std::fs::canonicalize(path.as_ref())
+			.map_err(|err| anyhow!("failed to canonicalize path: {err}"))?;
+		self.register_shared_folder(canonical, FLAG_READ | FLAG_SEARCH)
+	}
+
+	pub fn share_read_write_folder(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+		let canonical = std::fs::canonicalize(path.as_ref())
+			.map_err(|err| anyhow!("failed to canonicalize path: {err}"))?;
+		self.register_shared_folder(canonical, FLAG_READ | FLAG_WRITE | FLAG_SEARCH)
+	}
+
 	pub fn state(&self) -> Arc<Mutex<State>> {
 		self.state.clone()
 	}
@@ -694,11 +887,18 @@ impl PuppyPeer {
 	pub async fn list_dir(&self, peer: PeerId, path: impl Into<String>) -> Result<Vec<DirEntry>> {
 		let path = path.into();
 		let (tx, rx) = oneshot::channel();
-		self.cmd_tx.send(Command::ListDir { peer, path, tx }).map_err(|e| anyhow!("failed to send ListDir command: {e}"))?;
-		rx.await.map_err(|e| anyhow!("ListDir response channel closed: {e}"))?
+		self.cmd_tx
+			.send(Command::ListDir { peer, path, tx })
+			.map_err(|e| anyhow!("failed to send ListDir command: {e}"))?;
+		rx.await
+			.map_err(|e| anyhow!("ListDir response channel closed: {e}"))?
 	}
 
-	pub fn list_dir_blocking(&self, peer: PeerId, path: impl Into<String>) -> Result<Vec<DirEntry>> {
+	pub fn list_dir_blocking(
+		&self,
+		peer: PeerId,
+		path: impl Into<String>,
+	) -> Result<Vec<DirEntry>> {
 		block_on(self.list_dir(peer, path))
 	}
 
@@ -715,6 +915,19 @@ impl PuppyPeer {
 		block_on(self.list_cpus(peer_id))
 	}
 
+	pub async fn list_permissions(&self, peer: PeerId) -> Result<Vec<Permission>> {
+		let (tx, rx) = oneshot::channel();
+		self.cmd_tx
+			.send(Command::ListPermissions { peer, tx })
+			.map_err(|e| anyhow!("failed to send ListPermissions command: {e}"))?;
+		rx.await
+			.map_err(|e| anyhow!("ListPermissions response channel closed: {e}"))?
+	}
+
+	pub fn list_permissions_blocking(&self, peer: PeerId) -> Result<Vec<Permission>> {
+		block_on(self.list_permissions(peer))
+	}
+
 	pub async fn read_file(
 		&self,
 		peer: libp2p::PeerId,
@@ -724,8 +937,7 @@ impl PuppyPeer {
 	) -> Result<FileChunk> {
 		let path = path.into();
 		let (tx, rx) = oneshot::channel();
-		self
-			.cmd_tx
+		self.cmd_tx
 			.send(Command::ReadFile(ReadFileCmd {
 				peer_id: peer,
 				path,
@@ -734,7 +946,8 @@ impl PuppyPeer {
 				tx,
 			}))
 			.map_err(|e| anyhow!("failed to send ReadFile command: {e}"))?;
-		rx.await.map_err(|e| anyhow!("ReadFile response channel closed: {e}"))?
+		rx.await
+			.map_err(|e| anyhow!("ReadFile response channel closed: {e}"))?
 	}
 
 	pub fn read_file_blocking(

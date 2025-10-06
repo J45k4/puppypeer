@@ -72,17 +72,22 @@ jobs:
           openssl dgst -sha256 -sign private_key.pem -out target/release/puppypeer.sig target/release/puppypeer
           rm private_key.pem
       - name: Package Binary (Windows)
-        if: matrix.os == 'windows-latest'
+        if: startsWith(github.ref, 'refs/tags/') && matrix.os == 'windows-latest'
         id: package_windows
         shell: pwsh
+        env:
+          TAG_NAME: ${{ github.ref_name }}
         run: |
           $binaryName = "puppypeer.exe"
-          $archiveName = "$($binaryName)-${{ github.ref_name }}-windows.zip"
+          $archiveVersion = $env:TAG_NAME -replace '/', '-'
+          $archiveName = "${binaryName}-$archiveVersion-windows.zip"
           Compress-Archive -Path "target\release\$binaryName","target\release\puppypeer.sig" -DestinationPath "$archiveName"
           echo "artifact_name=$archiveName" >> $env:GITHUB_OUTPUT
       - name: Package Binary (Unix)
-        if: matrix.os != 'windows-latest'
+        if: startsWith(github.ref, 'refs/tags/') && matrix.os != 'windows-latest'
         id: package_unix
+        env:
+          TAG_NAME: ${{ github.ref_name }}
         run: |
           if [[ "${{ matrix.os }}" == "macos-latest" ]]; then
             ARCHIVE_SUFFIX="macos.tar.gz"
@@ -90,18 +95,19 @@ jobs:
             ARCHIVE_SUFFIX="linux.tar.gz"
           fi
           BINARY_NAME="puppypeer"
-          ARCHIVE_NAME="$BINARY_NAME-${{ github.ref_name }}-$ARCHIVE_SUFFIX"
+          TAG_SAFE="${TAG_NAME//\//-}"
+          ARCHIVE_NAME="$BINARY_NAME-$TAG_SAFE-$ARCHIVE_SUFFIX"
           # Include puppypeer and puppypeer.sig in the archive
           tar -czf "$ARCHIVE_NAME" -C target/release "$BINARY_NAME" "puppypeer.sig"
           echo "artifact_name=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
       - name: Upload Artifact (Windows)
-        if: matrix.os == 'windows-latest'
+        if: startsWith(github.ref, 'refs/tags/') && matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v4
         with:
           name: windows
           path: ${{ steps.package_windows.outputs.artifact_name }}
       - name: Upload Artifact (Unix)
-        if: matrix.os != 'windows-latest'
+        if: startsWith(github.ref, 'refs/tags/') && matrix.os != 'windows-latest'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.os }}

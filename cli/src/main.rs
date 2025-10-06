@@ -1,6 +1,6 @@
 use args::Command;
 use clap::Parser;
-use puppypeer_core::{PuppyPeer};
+use puppypeer_core::PuppyPeer;
 
 mod args;
 mod gui;
@@ -30,53 +30,63 @@ async fn main() {
 	#[cfg(feature = "ring")]
 	log::info!("ring enabled");
 
-	match args.command {
-		Some(command) => match command {
-			Command::Copy { src, dest } => {
-				log::info!("copying {} to {}", src, dest);
+	match &args.command {
+		Some(Command::Copy { src, dest }) => {
+			log::info!("copying {} to {}", src, dest);
+		}
+		Some(Command::Scan { path }) => {
+			log::info!("scanning {} (database disabled)", path);
+			return;
+		}
+		Some(Command::Install) => {
+			installer::install();
+			return;
+		}
+		Some(Command::Uninstall) => {
+			installer::uninstall();
+			return;
+		}
+		Some(Command::Update { version }) => {
+			if let Err(err) = updater::update(version.as_deref()).await {
+				log::error!("failed to update: {err:?}");
+				std::process::exit(1);
 			}
-			Command::Scan { path } => {
-				log::info!("scanning {} (database disabled)", path);
-				return;
+			log::info!("update completed successfully");
+			return;
+		}
+		Some(Command::Tui) => {
+			if let Err(err) = shell::run() {
+				log::error!("shell error: {err:?}");
+				std::process::exit(1);
 			}
-			Command::Install => {
-				installer::install();
-				return;
+			return;
+		}
+		Some(Command::Gui) => {
+			let app_title = format!("PuppyPeer v{}", version_label);
+			if let Err(err) = gui::run(app_title) {
+				log::error!("gui error: {err:?}");
+				std::process::exit(1);
 			}
-			Command::Uninstall => {
-				installer::uninstall();
-				return;
-			}
-			Command::Update { version } => {
-				if let Err(err) = updater::update(version.as_deref()).await {
-					log::error!("failed to update: {err:?}");
-					std::process::exit(1);
-				}
-				log::info!("update completed successfully");
-				return;
-			}
-			Command::Tui => {
-				if let Err(err) = shell::run() {
-					log::error!("shell error: {err:?}");
-					std::process::exit(1);
-				}
-				return;
-			}
-			Command::Gui => {
-				let app_title = format!("PuppyPeer v{}", version_label);
-				if let Err(err) = gui::run(app_title) {
-					log::error!("gui error: {err:?}");
-					std::process::exit(1);
-				}
-				return;
-			}
-			Command::Daemon => {
-				log::warn!("Daemon mode: disabled modules");
-				return;
-			}
-		},
+			return;
+		}
+		Some(Command::Daemon) => {
+			log::warn!("Daemon mode: disabled modules");
+			return;
+		}
 		None => {
 			let peer = PuppyPeer::new();
+			for path in &args.read {
+				if let Err(err) = peer.share_read_only_folder(path) {
+					log::error!("failed to share {} for read: {err:?}", path);
+					std::process::exit(1);
+				}
+			}
+			for path in &args.write {
+				if let Err(err) = peer.share_read_write_folder(path) {
+					log::error!("failed to share {} for read/write: {err:?}", path);
+					std::process::exit(1);
+				}
+			}
 			peer.wait().await;
 			return;
 		}

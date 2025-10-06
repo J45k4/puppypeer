@@ -86,7 +86,7 @@ pub enum PeerReq {
 	RevokeUser {
 		username: String,
 	},
-	
+	ListPermissions
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,6 +127,7 @@ pub enum PeerRes {
 	Users(Vec<UserSummary>),
 	Tokens(Vec<TokenInfo>),
 	Error(String),
+	Permissions(Vec<crate::state::Permission>)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
