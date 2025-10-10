@@ -15,7 +15,7 @@ mod utility;
 async fn main() {
 	let args = args::Args::parse();
 	let init_logging = match &args.command {
-		Some(Command::Tui) | Some(Command::Gui) => false,
+		Some(Command::Tui) => false,
 		_ => true,
 	};
 	if init_logging {
