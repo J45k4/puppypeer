@@ -622,12 +622,15 @@ impl ShellApp {
 							if entry.is_dir {
 								let peer_id = view.peer_id.clone();
 								let target = join_child_path(&view.path, &entry.name);
-								match self.peer.list_dir_blocking(peer_id.parse().unwrap(), target.clone()) {
+								match self
+									.peer
+									.list_dir_blocking(peer_id.parse().unwrap(), target.clone())
+								{
 									Ok(entries) => {
 										view.replace_entries(target.clone(), entries);
 										self.status_line =
-												format!("Browsing {} on {}", target, peer_id);
-										}
+											format!("Browsing {} on {}", target, peer_id);
+									}
 									Err(err) => {
 										self.status_line =
 											format!("Failed to open {}: {}", target, err);
@@ -646,7 +649,10 @@ impl ShellApp {
 						let parent = parent_path(&view.path);
 						if parent != view.path {
 							let peer_id = view.peer_id.clone();
-							match self.peer.list_dir_blocking(peer_id.parse().unwrap(), parent.clone()) {
+							match self
+								.peer
+								.list_dir_blocking(peer_id.parse().unwrap(), parent.clone())
+							{
 								Ok(entries) => {
 									view.replace_entries(parent.clone(), entries);
 									self.status_line =
@@ -747,7 +753,10 @@ impl ShellApp {
 	}
 
 	fn create_file_browser_view(&self, peer_id: String, path: &str) -> Result<FileBrowserView> {
-		let entries = self.peer.list_dir_blocking(peer_id.parse()?, path.to_string()).with_context(|| format!("listing {} locally", path))?;
+		let entries = self
+			.peer
+			.list_dir_blocking(peer_id.parse()?, path.to_string())
+			.with_context(|| format!("listing {} locally", path))?;
 		Ok(FileBrowserView::new(peer_id, path.to_string(), entries))
 	}
 

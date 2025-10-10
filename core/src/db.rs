@@ -1,8 +1,10 @@
 use std::env;
 use std::path::PathBuf;
 
+use anyhow::{anyhow, bail};
 use chrono::DateTime;
 use chrono::Utc;
+use libp2p::PeerId;
 use rusqlite::Connection;
 use rusqlite::ToSql;
 use rusqlite::params;
@@ -11,6 +13,7 @@ use tokio::sync::Mutex;
 
 use crate::scan::FileHash;
 use crate::scan::FileLocation;
+use crate::state::{FolderRule, Permission, Rule};
 
 pub type NodeID = [u8; 16];
 
@@ -20,104 +23,122 @@ struct Migration {
 	sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-	id: 20250208,
-	name: "init_database",
-	sql: r"
-		create table file_entries (
-			hash blob not null unique primary key,
-			size integer not null,
-			mime_type text null,
-			first_datetime timestamp null,
-			latest_datetime timestamp null
-		);
-		create table file_locations (
-			node_id BLOB not null,
-			path text not null,
-			hash blob null,
-			size integer not null,
-			timestamp timestamp not null,
-			created_at timestamp null,
-			modified_at timestamp null,
-			accessed_at timestamp null,
-			primary key (node_id, path)
-		);
-		create table nodes (
-			id BLOB primary key,
-			name text not null,
-			you bool not null,
-			total_memory integer not null,
-			system_name text not null,
-			kernel_version text not null,
-			os_version text not null,
-			created_at timestamp not null,
-			modified_at timestamp not null,
-			accessed_at timestamp not null
-		);
-		create table servers (
-			id integer primary key autoincrement,
-			port integer not null,
-			protocol integer not null
-		);
-		create table connections (
-			node_id BLOB not null,
-			url text not null,
-			type integer not null,
-			created_at timestamp not null,
-			last_used_at timestamp not null
-		);
-		create table cpus (
-			node_id BLOB not null,
-			name text not null,
-			usage real not null,
-			frequency integer not null,
-			created_at timestamp not null,
-			modified_at timestamp not null,
-			primary key(node_id,name)
-		);
-		create table disks (
-			node_id BLOB not null,
-			name text not null,
-			usage real not null,
-			total_size integer not null,
-			total_read_bytes integer not null,
-			total_written_bytes integer not null,
-			mount_path text not null,
-			filesystem text not null,
-			readonly bool not null,
-			removable bool not null,
-			kind text not null,
-			created_at timestamp not null,
-			modified_at timestamp not null,
-			primary key(node_id,name)
-		);
-		create table interfaces (
-			node_id BLOB not null,
-			name text not null,
-			ip text not null,
-			mac text not null,
-			loopback bool not null,
-			linklocal bool not null,
-			usage real not null,
-			total_received integer,
-			created_at timestamp not null,
-			modified_at timestamp not null,
-			primary key(node_id,name)
-		);
-		create table temperatures (
-			node_id BLOB not null,
-			label text not null,
-			temperature real null,
-			max real null,
-			critical real null,
-			created_at timestamp not null,
-			modified_at timestamp not null,
-			primary key(node_id, label)
-		);
-		CREATE INDEX IF NOT EXISTS idx_file_locations_path ON file_locations(path);
-		CREATE INDEX IF NOT EXISTS idx_file_locations_hash ON file_locations(hash);
+const MIGRATIONS: &[Migration] = &[
+	Migration {
+		id: 20250208,
+		name: "init_database",
+		sql: r"
+			create table file_entries (
+				hash blob not null unique primary key,
+				size integer not null,
+				mime_type text null,
+				first_datetime timestamp null,
+				latest_datetime timestamp null
+			);
+			create table file_locations (
+				node_id BLOB not null,
+				path text not null,
+				hash blob null,
+				size integer not null,
+				timestamp timestamp not null,
+				created_at timestamp null,
+				modified_at timestamp null,
+				accessed_at timestamp null,
+				primary key (node_id, path)
+			);
+			create table nodes (
+				id BLOB primary key,
+				name text not null,
+				you bool not null,
+				total_memory integer not null,
+				system_name text not null,
+				kernel_version text not null,
+				os_version text not null,
+				created_at timestamp not null,
+				modified_at timestamp not null,
+				accessed_at timestamp not null
+			);
+			create table servers (
+				id integer primary key autoincrement,
+				port integer not null,
+				protocol integer not null
+			);
+			create table connections (
+				node_id BLOB not null,
+				url text not null,
+				type integer not null,
+				created_at timestamp not null,
+				last_used_at timestamp not null
+			);
+			create table cpus (
+				node_id BLOB not null,
+				name text not null,
+				usage real not null,
+				frequency integer not null,
+				created_at timestamp not null,
+				modified_at timestamp not null,
+				primary key(node_id,name)
+			);
+			create table disks (
+				node_id BLOB not null,
+				name text not null,
+				usage real not null,
+				total_size integer not null,
+				total_read_bytes integer not null,
+				total_written_bytes integer not null,
+				mount_path text not null,
+				filesystem text not null,
+				readonly bool not null,
+				removable bool not null,
+				kind text not null,
+				created_at timestamp not null,
+				modified_at timestamp not null,
+				primary key(node_id,name)
+			);
+			create table interfaces (
+				node_id BLOB not null,
+				name text not null,
+				ip text not null,
+				mac text not null,
+				loopback bool not null,
+				linklocal bool not null,
+				usage real not null,
+				total_received integer,
+				created_at timestamp not null,
+				modified_at timestamp not null,
+				primary key(node_id,name)
+			);
+			create table temperatures (
+				node_id BLOB not null,
+				label text not null,
+				temperature real null,
+				max real null,
+				critical real null,
+				created_at timestamp not null,
+				modified_at timestamp not null,
+				primary key(node_id, label)
+			);
+			CREATE INDEX IF NOT EXISTS idx_file_locations_path ON file_locations(path);
+			CREATE INDEX IF NOT EXISTS idx_file_locations_hash ON file_locations(hash);
 		",
-}];
+	},
+	Migration {
+		id: 20250219,
+		name: "peer_permissions",
+		sql: r"
+			create table peer_permissions (
+				id integer primary key autoincrement,
+				src_peer blob not null,
+				target_peer blob not null,
+				rule_type integer not null,
+				path text null,
+				flags integer null,
+				expires_at integer null
+			);
+			create index if not exists idx_peer_permissions_src_target on peer_permissions(src_peer, target_peer);
+		",
+	},
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Node {
@@ -603,6 +624,83 @@ pub fn get_file_location(
 	}
 }
 
+const RULE_TYPE_OWNER: i64 = 0;
+const RULE_TYPE_FOLDER: i64 = 1;
+
+pub fn save_peer_permissions(
+	conn: &mut Connection,
+	src_peer: &PeerId,
+	target_peer: &PeerId,
+	permissions: &[Permission],
+) -> anyhow::Result<()> {
+	let src_bytes = src_peer.to_bytes();
+	let target_bytes = target_peer.to_bytes();
+	let tx = conn.transaction()?;
+	tx.execute(
+		"DELETE FROM peer_permissions WHERE src_peer = ?1 AND target_peer = ?2",
+		params![&src_bytes, &target_bytes],
+	)?;
+	for permission in permissions {
+		let (rule_type, path_value, flags_value) = match permission.rule() {
+			Rule::Owner => (RULE_TYPE_OWNER, None, None),
+			Rule::Folder(folder) => (
+				RULE_TYPE_FOLDER,
+				Some(folder.path().to_string_lossy().into_owned()),
+				Some(folder.flags() as i64),
+			),
+		};
+		tx.execute(
+			"INSERT INTO peer_permissions (src_peer, target_peer, rule_type, path, flags, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+			params![
+				&src_bytes,
+				&target_bytes,
+				rule_type,
+				path_value.as_deref(),
+				flags_value,
+				permission.expires_at(),
+			],
+		)?;
+	}
+	tx.commit()?;
+	Ok(())
+}
+
+pub fn load_peer_permissions(
+	conn: &Connection,
+	src_peer: &PeerId,
+) -> anyhow::Result<Vec<(PeerId, Vec<Permission>)>> {
+	let src_bytes = src_peer.to_bytes();
+	let mut stmt = conn.prepare(
+		"SELECT target_peer, rule_type, path, flags, expires_at FROM peer_permissions WHERE src_peer = ?1 ORDER BY id ASC",
+	)?;
+	let mut rows = stmt.query(params![&src_bytes])?;
+	let mut results: Vec<(PeerId, Vec<Permission>)> = Vec::new();
+	while let Some(row) = rows.next()? {
+		let target_bytes: Vec<u8> = row.get(0)?;
+		let target_peer = PeerId::from_bytes(&target_bytes)
+			.map_err(|err| anyhow!("invalid peer id from database: {err}"))?;
+		let rule_type: i64 = row.get(1)?;
+		let permission = match rule_type {
+			RULE_TYPE_OWNER => Permission::with_expiration(Rule::Owner, row.get(4)?),
+			RULE_TYPE_FOLDER => {
+				let path: Option<String> = row.get(2)?;
+				let flags: Option<i64> = row.get(3)?;
+				let path = path.ok_or_else(|| anyhow!("missing folder path for permission"))?;
+				let flags = flags.ok_or_else(|| anyhow!("missing folder flags for permission"))?;
+				let folder = FolderRule::new(PathBuf::from(path), flags as u8);
+				Permission::with_expiration(Rule::Folder(folder), row.get(4)?)
+			}
+			other => bail!("unsupported rule type {other}"),
+		};
+		if let Some((_, perms)) = results.iter_mut().find(|(peer, _)| *peer == target_peer) {
+			perms.push(permission);
+		} else {
+			results.push((target_peer, vec![permission]));
+		}
+	}
+	Ok(results)
+}
+
 /// Runs embedded database migrations.
 ///
 /// # Arguments
@@ -665,6 +763,6 @@ pub fn run_migrations(conn: &mut Connection) -> anyhow::Result<()> {
 }
 
 pub fn open_db() -> Connection {
-	let db_name = env::var("DB").unwrap_or_else(|_| String::from("puppyagent.db"));
+	let db_name = env::var("DB").unwrap_or_else(|_| String::from("puppyapp.db"));
 	Connection::open(db_name).unwrap()
 }

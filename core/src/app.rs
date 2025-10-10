@@ -1,6 +1,7 @@
 use crate::p2p::{AuthMethod, CpuInfo, DirEntry, FileWriteAck, InterfaceInfo, PeerReq, PeerRes};
 use crate::types::FileChunk;
 use crate::{
+	db::{load_peer_permissions, open_db, run_migrations},
 	p2p::{AgentBehaviour, AgentEvent, build_swarm, load_or_generate_keypair},
 	state::{Connection, FLAG_READ, FLAG_SEARCH, FLAG_WRITE, FolderRule, Permission, State},
 };
@@ -232,6 +233,21 @@ impl App {
 		let peer_id = PeerId::from(id_keys.public());
 
 		let mut swarm = build_swarm(id_keys, peer_id).unwrap();
+		let stored_permissions = {
+			let mut conn = open_db();
+			if let Err(err) = run_migrations(&mut conn) {
+				log::error!("failed to run database migrations: {err}");
+				Vec::new()
+			} else {
+				match load_peer_permissions(&conn, &peer_id) {
+					Ok(perms) => perms,
+					Err(err) => {
+						log::error!("failed to load peer permissions: {err}");
+						Vec::new()
+					}
+				}
+			}
+		};
 		let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
 		let listen_addr = "/ip4/0.0.0.0/tcp/0".parse().unwrap();
@@ -241,6 +257,9 @@ impl App {
 		{
 			if let Ok(mut s) = state.lock() {
 				s.me = peer_id;
+				for (target, permissions) in stored_permissions {
+					s.set_peer_permissions_from_storage(target, permissions);
+				}
 			}
 		}
 		(
@@ -334,7 +353,13 @@ impl App {
 				offset,
 				length,
 			} => {
-				log::info!("[{}] ReadFile {} (offset {}, length {:?})", peer, path, offset, length);
+				log::info!(
+					"[{}] ReadFile {} (offset {}, length {:?})",
+					peer,
+					path,
+					offset,
+					length
+				);
 				let canonical = match fs::canonicalize(&path).await {
 					Ok(p) => p,
 					Err(err) => {
@@ -349,7 +374,13 @@ impl App {
 				PeerRes::FileChunk(read_file(canonical.as_path(), offset, length).await?)
 			}
 			PeerReq::WriteFile { path, offset, data } => {
-				log::info!("[{}] WriteFile {} (offset {}, {} bytes)", peer, path, offset, data.len());
+				log::info!(
+					"[{}] WriteFile {} (offset {}, {} bytes)",
+					peer,
+					path,
+					offset,
+					data.len()
+				);
 				let requested_path = PathBuf::from(&path);
 				let canonical = match fs::metadata(&requested_path).await {
 					Ok(_) => match fs::canonicalize(&requested_path).await {
@@ -880,6 +911,19 @@ impl PuppyPeer {
 		self.register_shared_folder(canonical, FLAG_READ | FLAG_WRITE | FLAG_SEARCH)
 	}
 
+	pub fn set_peer_permissions(
+		&self,
+		peer: PeerId,
+		permissions: Vec<Permission>,
+	) -> anyhow::Result<()> {
+		let mut state = self
+			.state
+			.lock()
+			.map_err(|_| anyhow!("state lock poisoned"))?;
+		state.set_peer_permissions(peer, permissions);
+		state.save_changes()
+	}
+
 	pub fn state(&self) -> Arc<Mutex<State>> {
 		self.state.clone()
 	}
@@ -913,6 +957,14 @@ impl PuppyPeer {
 
 	pub fn list_cpus_blocking(&self, peer_id: PeerId) -> Result<Vec<CpuInfo>> {
 		block_on(self.list_cpus(peer_id))
+	}
+
+	pub fn list_granted_permissions(&self, peer: PeerId) -> Result<Vec<Permission>> {
+		let state = self
+			.state
+			.lock()
+			.map_err(|_| anyhow!("state lock poisoned"))?;
+		Ok(state.permissions_granted_to_peer(&peer))
 	}
 
 	pub async fn list_permissions(&self, peer: PeerId) -> Result<Vec<Permission>> {

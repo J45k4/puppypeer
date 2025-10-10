@@ -86,7 +86,7 @@ pub enum PeerReq {
 	RevokeUser {
 		username: String,
 	},
-	ListPermissions
+	ListPermissions,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,7 +127,7 @@ pub enum PeerRes {
 	Users(Vec<UserSummary>),
 	Tokens(Vec<TokenInfo>),
 	Error(String),
-	Permissions(Vec<crate::state::Permission>)
+	Permissions(Vec<crate::state::Permission>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,8 +141,6 @@ pub struct DirEntry {
 	pub modified_at: Option<DateTime<Utc>>,
 	pub accessed_at: Option<DateTime<Utc>>,
 }
-
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileWriteAck {

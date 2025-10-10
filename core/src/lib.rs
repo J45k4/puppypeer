@@ -1,10 +1,10 @@
 mod app;
 mod db;
-mod types;
 pub mod p2p;
 pub mod scan;
 mod state;
-pub use state::{FolderRule, Permission, Rule, State};
+mod types;
+pub use state::{FLAG_READ, FLAG_SEARCH, FLAG_WRITE, FolderRule, Permission, Rule, State};
 pub use types::FileChunk;
 pub mod wait_group;
 pub use app::PuppyPeer;

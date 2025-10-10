@@ -1,20 +1,24 @@
 use std::collections::{BTreeSet, HashMap};
-use std::{any, mem};
+use std::mem;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Context;
 use iced::alignment::{Horizontal, Vertical};
 use iced::executor;
 use iced::theme;
 use iced::time;
-use iced::widget::{button, container, pick_list, scrollable, text, text_input, tooltip, Image};
 use iced::widget::image::Handle as ImageHandle;
+use iced::widget::{
+	Image, button, checkbox, container, pick_list, scrollable, text, text_input, tooltip,
+};
 use iced::{Application, Command, Element, Length, Settings, Subscription, Theme};
 use libp2p::PeerId;
 use puppypeer_core::p2p::{CpuInfo, DirEntry};
-use puppypeer_core::{FileChunk, Permission, PuppyPeer, Rule, State};
+use puppypeer_core::{
+	FLAG_READ, FLAG_SEARCH, FLAG_WRITE, FileChunk, FolderRule, Permission, PuppyPeer, Rule, State,
+};
 
 const LOCAL_LISTEN_MULTIADDR: &str = "/ip4/0.0.0.0:8336";
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
@@ -60,6 +64,97 @@ struct PeerRow {
 struct PeerCpuState {
 	peer_id: String,
 	cpus: Vec<CpuInfo>,
+}
+
+#[derive(Debug, Clone)]
+struct PeerPermissionsState {
+	peer_id: String,
+	owner: bool,
+	folders: Vec<EditableFolderPermission>,
+	loading: bool,
+	saving: bool,
+	error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct EditableFolderPermission {
+	path: String,
+	read: bool,
+	write: bool,
+}
+
+impl PeerPermissionsState {
+	fn loading(peer_id: String) -> Self {
+		Self {
+			peer_id,
+			owner: false,
+			folders: Vec::new(),
+			loading: true,
+			saving: false,
+			error: None,
+		}
+	}
+
+	fn from_permissions(peer_id: String, permissions: Vec<Permission>) -> Self {
+		let mut state = Self::loading(peer_id);
+		state.loading = false;
+		for permission in permissions {
+			match permission.rule() {
+				Rule::Owner => {
+					state.owner = true;
+				}
+				Rule::Folder(rule) => {
+					state
+						.folders
+						.push(EditableFolderPermission::from_rule(rule));
+				}
+			}
+		}
+		state
+	}
+
+	fn build_permissions(&self) -> Result<Vec<Permission>, String> {
+		let mut permissions = Vec::new();
+		if self.owner {
+			permissions.push(Permission::new(Rule::Owner));
+		}
+		for folder in &self.folders {
+			let permission = folder.to_permission()?;
+			permissions.push(permission);
+		}
+		Ok(permissions)
+	}
+}
+
+impl EditableFolderPermission {
+	fn from_rule(rule: &FolderRule) -> Self {
+		Self {
+			path: rule.path().to_string_lossy().to_string(),
+			read: rule.can_read(),
+			write: rule.can_write(),
+		}
+	}
+
+	fn to_permission(&self) -> Result<Permission, String> {
+		if self.path.trim().is_empty() {
+			return Err(String::from("Folder path cannot be empty"));
+		}
+		let normalized = normalize_path(&self.path);
+		let mut flags = FLAG_SEARCH;
+		if self.read {
+			flags |= FLAG_READ;
+		}
+		if self.write {
+			flags |= FLAG_WRITE;
+		}
+		if flags == FLAG_SEARCH {
+			return Err(format!(
+				"Permission for {normalized} must allow read or write access"
+			));
+		}
+		let rule = Rule::Folder(FolderRule::new(PathBuf::from(&normalized), flags));
+		Ok(Permission::new(rule))
+	}
 }
 
 #[derive(Debug, Clone)]
@@ -130,8 +225,7 @@ impl FileViewerState {
 	}
 
 	fn is_image(&self) -> bool {
-		self
-			.mime
+		self.mime
 			.as_deref()
 			.map(|value| value.starts_with("image/"))
 			.unwrap_or(false)
@@ -251,7 +345,11 @@ fn map_result<T>(result: anyhow::Result<T, anyhow::Error>) -> Result<T, String> 
 	result.map_err(|err| format!("{err}"))
 }
 
-async fn list_dir(peer: Arc<PuppyPeer>, peer_id: String, path: String) -> (String, String, Result<Vec<DirEntry>, String>) {
+async fn list_dir(
+	peer: Arc<PuppyPeer>,
+	peer_id: String,
+	path: String,
+) -> (String, String, Result<Vec<DirEntry>, String>) {
 	let target = PeerId::from_str(&peer_id).unwrap();
 	let result = peer.list_dir(target, path.clone()).await;
 	(peer_id, path, map_result(result))
@@ -266,9 +364,35 @@ async fn list_permissions(
 	(peer_id, map_result(result))
 }
 
-async fn read_file(peer: Arc<PuppyPeer>, peer_id: String, path: String, offset: u64) -> (String, String, u64, Result<FileChunk, String>) {
+async fn list_granted_permissions(
+	peer: Arc<PuppyPeer>,
+	peer_id: String,
+) -> (String, Result<Vec<Permission>, String>) {
 	let target = PeerId::from_str(&peer_id).unwrap();
-	let result = peer.read_file(target, path.clone(), offset, Some(FILE_VIEW_CHUNK_SIZE)).await;
+	let result = peer.list_granted_permissions(target);
+	(peer_id, result.map_err(|err| format!("{err}")))
+}
+
+async fn set_permissions(
+	peer: Arc<PuppyPeer>,
+	peer_id: String,
+	permissions: Vec<Permission>,
+) -> (String, Result<Vec<Permission>, String>) {
+	let target = PeerId::from_str(&peer_id).unwrap();
+	let result = peer.set_peer_permissions(target, permissions.clone());
+	(peer_id, map_result(result.map(|_| permissions)))
+}
+
+async fn read_file(
+	peer: Arc<PuppyPeer>,
+	peer_id: String,
+	path: String,
+	offset: u64,
+) -> (String, String, u64, Result<FileChunk, String>) {
+	let target = PeerId::from_str(&peer_id).unwrap();
+	let result = peer
+		.read_file(target, path.clone(), offset, Some(FILE_VIEW_CHUNK_SIZE))
+		.await;
 	(peer_id, path, offset, map_result(result))
 }
 
@@ -289,6 +413,7 @@ pub struct GuiApp {
 enum Mode {
 	Peers,
 	PeerActions { peer_id: String },
+	PeerPermissions(PeerPermissionsState),
 	PeerCpus(PeerCpuState),
 	FileBrowser(FileBrowserState),
 	FileViewer(FileViewerState),
@@ -303,6 +428,31 @@ pub enum GuiMessage {
 	MenuSelected(MenuItem),
 	BackToPeers,
 	PeerActionsRequested(String),
+	PeerPermissionsRequested(String),
+	PeerPermissionsLoaded {
+		peer_id: String,
+		permissions: Result<Vec<Permission>, String>,
+	},
+	PeerPermissionsOwnerToggled(bool),
+	PeerPermissionsFolderPathChanged {
+		index: usize,
+		path: String,
+	},
+	PeerPermissionsFolderReadToggled {
+		index: usize,
+		value: bool,
+	},
+	PeerPermissionsFolderWriteToggled {
+		index: usize,
+		value: bool,
+	},
+	PeerPermissionsFolderRemoved(usize),
+	PeerPermissionsAddFolder,
+	PeerPermissionsSave,
+	PeerPermissionsSaved {
+		peer_id: String,
+		result: Result<Vec<Permission>, String>,
+	},
 	CpuRequested(String),
 	CpuLoaded(String, Result<Vec<CpuInfo>, String>),
 	FileBrowserRequested {
@@ -438,6 +588,141 @@ impl Application for GuiApp {
 				self.status = format!("Peer actions for {}", peer_id);
 				Command::none()
 			}
+			GuiMessage::PeerPermissionsRequested(peer_id) => {
+				self.status = format!("Loading permissions for {}...", peer_id);
+				self.selected_peer_id = Some(peer_id.clone());
+				self.mode = Mode::PeerPermissions(PeerPermissionsState::loading(peer_id.clone()));
+				let peer = self.peer.clone();
+				Command::perform(
+					list_granted_permissions(peer, peer_id.clone()),
+					|(peer_id, permissions)| GuiMessage::PeerPermissionsLoaded {
+						peer_id,
+						permissions,
+					},
+				)
+			}
+			GuiMessage::PeerPermissionsLoaded {
+				peer_id,
+				permissions,
+			} => {
+				if let Mode::PeerPermissions(state) = &mut self.mode {
+					if state.peer_id == peer_id {
+						match permissions {
+							Ok(perms) => {
+								*state =
+									PeerPermissionsState::from_permissions(peer_id.clone(), perms);
+								self.status = format!("Permissions loaded for {}", peer_id);
+							}
+							Err(err) => {
+								state.loading = false;
+								state.error = Some(err.clone());
+								self.status =
+									format!("Failed to load permissions for {}: {}", peer_id, err);
+							}
+						}
+					}
+				}
+				Command::none()
+			}
+			GuiMessage::PeerPermissionsOwnerToggled(value) => {
+				if let Mode::PeerPermissions(state) = &mut self.mode {
+					state.owner = value;
+					state.error = None;
+				}
+				Command::none()
+			}
+			GuiMessage::PeerPermissionsFolderPathChanged { index, path } => {
+				if let Mode::PeerPermissions(state) = &mut self.mode {
+					if let Some(folder) = state.folders.get_mut(index) {
+						folder.path = path;
+					}
+					state.error = None;
+				}
+				Command::none()
+			}
+			GuiMessage::PeerPermissionsFolderReadToggled { index, value } => {
+				if let Mode::PeerPermissions(state) = &mut self.mode {
+					if let Some(folder) = state.folders.get_mut(index) {
+						folder.read = value;
+					}
+					state.error = None;
+				}
+				Command::none()
+			}
+			GuiMessage::PeerPermissionsFolderWriteToggled { index, value } => {
+				if let Mode::PeerPermissions(state) = &mut self.mode {
+					if let Some(folder) = state.folders.get_mut(index) {
+						folder.write = value;
+					}
+					state.error = None;
+				}
+				Command::none()
+			}
+			GuiMessage::PeerPermissionsFolderRemoved(index) => {
+				if let Mode::PeerPermissions(state) = &mut self.mode {
+					if index < state.folders.len() {
+						state.folders.remove(index);
+					}
+					state.error = None;
+				}
+				Command::none()
+			}
+			GuiMessage::PeerPermissionsAddFolder => {
+				if let Mode::PeerPermissions(state) = &mut self.mode {
+					state.folders.push(EditableFolderPermission {
+						path: String::from("/"),
+						read: true,
+						write: false,
+					});
+					state.error = None;
+				}
+				Command::none()
+			}
+			GuiMessage::PeerPermissionsSave => {
+				if let Mode::PeerPermissions(state) = &mut self.mode {
+					match state.build_permissions() {
+						Ok(permissions) => {
+							let peer_id = state.peer_id.clone();
+							state.saving = true;
+							state.error = None;
+							self.status = format!("Saving permissions for {}...", peer_id);
+							let peer = self.peer.clone();
+							return Command::perform(
+								set_permissions(peer, peer_id.clone(), permissions),
+								|(peer_id, result)| GuiMessage::PeerPermissionsSaved {
+									peer_id,
+									result,
+								},
+							);
+						}
+						Err(err) => {
+							state.error = Some(err.clone());
+							self.status = format!("Failed to prepare permissions: {}", err);
+						}
+					}
+				}
+				Command::none()
+			}
+			GuiMessage::PeerPermissionsSaved { peer_id, result } => {
+				if let Mode::PeerPermissions(state) = &mut self.mode {
+					if state.peer_id == peer_id {
+						state.saving = false;
+						match result {
+							Ok(perms) => {
+								*state =
+									PeerPermissionsState::from_permissions(peer_id.clone(), perms);
+								self.status = format!("Permissions updated for {}", peer_id);
+							}
+							Err(err) => {
+								state.error = Some(err.clone());
+								self.status =
+									format!("Failed to save permissions for {}: {}", peer_id, err);
+							}
+						}
+					}
+				}
+				Command::none()
+			}
 			GuiMessage::CpuRequested(peer_id) => {
 				self.status = format!("Loading CPU info for {}...", peer_id);
 				let peer = self.peer.clone();
@@ -460,7 +745,8 @@ impl Application for GuiApp {
 			}
 			GuiMessage::FileBrowserRequested { peer_id } => {
 				self.status = format!("Fetching shared folders for {}...", peer_id);
-				self.mode = Mode::FileBrowser(FileBrowserState::new(peer_id.clone(), String::new()));
+				self.mode =
+					Mode::FileBrowser(FileBrowserState::new(peer_id.clone(), String::new()));
 				self.selected_peer_id = Some(peer_id.clone());
 				if let Mode::FileBrowser(state) = &mut self.mode {
 					state.entries.clear();
@@ -477,50 +763,53 @@ impl Application for GuiApp {
 					},
 				)
 			}
-			GuiMessage::FileBrowserPermissionsLoaded { peer_id, permissions } => {
-				match permissions {
-					Ok(perms) => {
-						let default_path = default_browser_path(&perms).unwrap_or_else(|| String::from("/"));
-						let list_path = default_path.clone();
-						let status_path = default_path.clone();
-						let roots = permissions_roots(&perms);
-						self.status = format!("Listing {} on {}...", status_path, peer_id);
-						match &mut self.mode {
-							Mode::FileBrowser(state) if state.peer_id == peer_id => {
-								state.path = default_path.clone();
-								state.available_roots = roots.clone();
-								state.entries.clear();
-								state.loading = true;
-								state.error = None;
-							}
-							_ => {
-								let mut state = FileBrowserState::new(peer_id.clone(), default_path.clone());
-								state.available_roots = roots.clone();
-								self.mode = Mode::FileBrowser(state);
-							}
+			GuiMessage::FileBrowserPermissionsLoaded {
+				peer_id,
+				permissions,
+			} => match permissions {
+				Ok(perms) => {
+					let default_path =
+						default_browser_path(&perms).unwrap_or_else(|| String::from("/"));
+					let list_path = default_path.clone();
+					let status_path = default_path.clone();
+					let roots = permissions_roots(&perms);
+					self.status = format!("Listing {} on {}...", status_path, peer_id);
+					match &mut self.mode {
+						Mode::FileBrowser(state) if state.peer_id == peer_id => {
+							state.path = default_path.clone();
+							state.available_roots = roots.clone();
+							state.entries.clear();
+							state.loading = true;
+							state.error = None;
 						}
-						let peer = self.peer.clone();
-						return Command::perform(
-							list_dir(peer, peer_id.clone(), list_path),
-							|(peer_id, path, entries)| GuiMessage::FileBrowserLoaded {
-								peer_id,
-								path,
-								entries,
-							},
-						);
-					}
-					Err(err) => {
-						self.status = format!("Failed to fetch permissions: {}", err);
-						if let Mode::FileBrowser(state) = &mut self.mode {
-							if state.peer_id == peer_id {
-								state.loading = false;
-								state.error = Some(err.clone());
-							}
+						_ => {
+							let mut state =
+								FileBrowserState::new(peer_id.clone(), default_path.clone());
+							state.available_roots = roots.clone();
+							self.mode = Mode::FileBrowser(state);
 						}
-						return Command::none();
 					}
+					let peer = self.peer.clone();
+					return Command::perform(
+						list_dir(peer, peer_id.clone(), list_path),
+						|(peer_id, path, entries)| GuiMessage::FileBrowserLoaded {
+							peer_id,
+							path,
+							entries,
+						},
+					);
 				}
-			}
+				Err(err) => {
+					self.status = format!("Failed to fetch permissions: {}", err);
+					if let Mode::FileBrowser(state) = &mut self.mode {
+						if state.peer_id == peer_id {
+							state.loading = false;
+							state.error = Some(err.clone());
+						}
+					}
+					return Command::none();
+				}
+			},
 			GuiMessage::FileBrowserLoaded {
 				peer_id,
 				path,
@@ -646,12 +935,24 @@ impl Application for GuiApp {
 								let chunk_len = chunk.data.len();
 								state.error = None;
 								state.apply_chunk(chunk);
-								let mime_label = state.mime.clone().unwrap_or_else(|| String::from("?"));
-								let base_status = if state.is_image() && state.eof && !state.data.is_empty() {
-									format!("Image loaded: {} bytes | {}", state.data.len(), mime_label)
+								let mime_label =
+									state.mime.clone().unwrap_or_else(|| String::from("?"));
+								let base_status = if state.is_image()
+									&& state.eof && !state.data.is_empty()
+								{
+									format!(
+										"Image loaded: {} bytes | {}",
+										state.data.len(),
+										mime_label
+									)
 								} else {
 									let eof_note = if state.eof { " (end of file)" } else { "" };
-									format!("Loaded {} bytes{} | {}", state.data.len(), eof_note, mime_label)
+									format!(
+										"Loaded {} bytes{} | {}",
+										state.data.len(),
+										eof_note,
+										mime_label
+									)
 								};
 								let progressed = state.offset > prev_offset;
 								if state.eof {
@@ -665,20 +966,20 @@ impl Application for GuiApp {
 									let peer = self.peer.clone();
 									next_command = Command::perform(
 										read_file(peer, peer_id.clone(), path.clone(), offset),
-										|(peer_id, path, offset, result)| GuiMessage::FileReadLoaded {
-											peer_id,
-											path,
-											offset,
-											result,
+										|(peer_id, path, offset, result)| {
+											GuiMessage::FileReadLoaded {
+												peer_id,
+												path,
+												offset,
+												result,
+											}
 										},
 									);
 								} else {
 									// No progress in this chunk; leave loading stopped for manual retry.
 									self.status = format!(
 										"{}; waiting for more data at offset {} (received {} bytes)",
-										base_status,
-										state.offset,
-										chunk_len,
+										base_status, state.offset, chunk_len,
 									);
 								}
 							}
@@ -769,25 +1070,40 @@ impl Application for GuiApp {
 				Command::none()
 			}
 			GuiMessage::FileSearchQueryChanged(q) => {
-				if let Mode::FileSearch(state) = &mut self.mode { state.query = q; }
+				if let Mode::FileSearch(state) = &mut self.mode {
+					state.query = q;
+				}
 				Command::none()
 			}
 			GuiMessage::FileSearchMimeChanged(m) => {
-				if let Mode::FileSearch(state) = &mut self.mode { state.selected_mime = m; }
+				if let Mode::FileSearch(state) = &mut self.mode {
+					state.selected_mime = m;
+				}
 				Command::none()
 			}
 			GuiMessage::FileSearchToggleSort => {
-				if let Mode::FileSearch(state) = &mut self.mode { state.sort_desc = !state.sort_desc; }
+				if let Mode::FileSearch(state) = &mut self.mode {
+					state.sort_desc = !state.sort_desc;
+				}
 				Command::none()
 			}
 			GuiMessage::FileSearchExecute => {
 				if let Mode::FileSearch(state) = &mut self.mode {
-					state.loading = true; state.error = None; state.results.clear();
+					state.loading = true;
+					state.error = None;
+					state.results.clear();
 					let query = state.query.clone();
-					let mime = if state.selected_mime.trim().is_empty() { None } else { Some(state.selected_mime.clone()) };
+					let mime = if state.selected_mime.trim().is_empty() {
+						None
+					} else {
+						Some(state.selected_mime.clone())
+					};
 					let sort_desc = state.sort_desc;
 					let peer = self.peer.clone();
-					return Command::perform(search_files(peer, query, mime, sort_desc), GuiMessage::FileSearchLoaded);
+					return Command::perform(
+						search_files(peer, query, mime, sort_desc),
+						GuiMessage::FileSearchLoaded,
+					);
 				}
 				Command::none()
 			}
@@ -795,8 +1111,15 @@ impl Application for GuiApp {
 				if let Mode::FileSearch(state) = &mut self.mode {
 					state.loading = false;
 					match result {
-						Ok((entries, mimes)) => { state.results = entries; state.available_mime_types = mimes; self.status = format!("Search loaded: {} files", state.results.len()); }
-						Err(err) => { state.error = Some(err.clone()); self.status = format!("Search failed: {}", err); }
+						Ok((entries, mimes)) => {
+							state.results = entries;
+							state.available_mime_types = mimes;
+							self.status = format!("Search loaded: {} files", state.results.len());
+						}
+						Err(err) => {
+							state.error = Some(err.clone());
+							self.status = format!("Search failed: {}", err);
+						}
 					}
 				}
 				Command::none()
@@ -823,6 +1146,7 @@ impl Application for GuiApp {
 		let content: Element<_> = match &self.mode {
 			Mode::Peers => self.view_peers(),
 			Mode::PeerActions { peer_id } => self.view_peer_actions(peer_id),
+			Mode::PeerPermissions(state) => self.view_peer_permissions(state),
 			Mode::PeerCpus(state) => self.view_peer_cpus(state),
 			Mode::FileBrowser(state) => self.view_file_browser(state),
 			Mode::FileViewer(state) => self.view_file_viewer(state),
@@ -867,14 +1191,22 @@ impl GuiApp {
 			{
 				self.selected_peer_id = None;
 			}
-			let missing_peer = if let Mode::PeerActions { peer_id } = &self.mode {
-				if !self.peers.iter().any(|p| p.id == *peer_id) {
-					Some(peer_id.clone())
-				} else {
-					None
+			let missing_peer = match &self.mode {
+				Mode::PeerActions { peer_id } => {
+					if !self.peers.iter().any(|p| p.id == *peer_id) {
+						Some(peer_id.clone())
+					} else {
+						None
+					}
 				}
-			} else {
-				None
+				Mode::PeerPermissions(state) => {
+					if !self.peers.iter().any(|p| p.id == state.peer_id) {
+						Some(state.peer_id.clone())
+					} else {
+						None
+					}
+				}
+				_ => None,
 			};
 			if let Some(peer_id) = missing_peer {
 				self.mode = Mode::Peers;
@@ -967,6 +1299,10 @@ impl GuiApp {
 						peer_id: peer.id.clone(),
 					}),
 				)
+				.push(
+					button(text("Permissions"))
+						.on_press(GuiMessage::PeerPermissionsRequested(peer.id.clone())),
+				)
 				.push(button(text("Back")).on_press(GuiMessage::BackToPeers));
 			layout = layout.push(controls);
 			layout.into()
@@ -978,6 +1314,85 @@ impl GuiApp {
 				.height(Length::Fill)
 				.into()
 		}
+	}
+
+	fn view_peer_permissions(&self, state: &PeerPermissionsState) -> Element<'_, GuiMessage> {
+		let mut layout = iced::widget::Column::new().spacing(12);
+		layout = layout.push(text(format!("Permissions for {}", state.peer_id)).size(24));
+		if state.loading {
+			layout = layout.push(text("Loading permissions...").size(16));
+			return layout.into();
+		}
+		if let Some(err) = &state.error {
+			layout = layout.push(text(format!("Error: {}", err)).size(14));
+		}
+		let owner_toggle = checkbox("Grant owner access (full control)", state.owner)
+			.on_toggle(GuiMessage::PeerPermissionsOwnerToggled);
+		layout = layout.push(owner_toggle);
+		let saving = state.saving;
+		let mut folders_column = iced::widget::Column::new().spacing(8);
+		if state.folders.is_empty() {
+			folders_column = folders_column.push(text("No folder permissions granted.").size(14));
+		} else {
+			for (idx, folder) in state.folders.iter().enumerate() {
+				let path_input = text_input("Shared folder path", &folder.path)
+					.padding(8)
+					.size(16)
+					.on_input({
+						let index = idx;
+						move |value| GuiMessage::PeerPermissionsFolderPathChanged {
+							index,
+							path: value,
+						}
+					});
+				let read_toggle = checkbox("Read", folder.read).on_toggle({
+					let index = idx;
+					move |value| GuiMessage::PeerPermissionsFolderReadToggled { index, value }
+				});
+				let write_toggle = checkbox("Write", folder.write).on_toggle({
+					let index = idx;
+					move |value| GuiMessage::PeerPermissionsFolderWriteToggled { index, value }
+				});
+				let mut remove_button = button(text("Remove"));
+				if !saving {
+					let index = idx;
+					remove_button =
+						remove_button.on_press(GuiMessage::PeerPermissionsFolderRemoved(index));
+				}
+				let toggles = iced::widget::Row::new()
+					.spacing(12)
+					.push(read_toggle)
+					.push(write_toggle)
+					.push(remove_button);
+				let card = container(
+					iced::widget::Column::new()
+						.spacing(8)
+						.push(path_input)
+						.push(toggles),
+				)
+				.padding(8)
+				.style(theme::Container::Box);
+				folders_column = folders_column.push(card);
+			}
+		}
+		layout = layout.push(scrollable(folders_column).height(Length::Fill));
+		let mut controls = iced::widget::Row::new().spacing(12);
+		let mut add_button = button(text("Add folder"));
+		if !saving {
+			add_button = add_button.on_press(GuiMessage::PeerPermissionsAddFolder);
+		}
+		controls = controls.push(add_button);
+		let mut save_button = button(text(if saving { "Saving..." } else { "Save changes" }));
+		if !saving {
+			save_button = save_button.on_press(GuiMessage::PeerPermissionsSave);
+		}
+		controls = controls.push(save_button);
+		controls = controls.push(
+			button(text("Back to actions"))
+				.on_press(GuiMessage::PeerActionsRequested(state.peer_id.clone())),
+		);
+		layout = layout.push(controls);
+		layout.into()
 	}
 
 	fn view_peer_cpus(&self, state: &PeerCpuState) -> Element<'_, GuiMessage> {
@@ -1080,7 +1495,9 @@ impl GuiApp {
 					layout = layout.push(text("Image data not yet loaded").size(14));
 				}
 			} else if !state.eof {
-				layout = layout.push(text("Partial image data loaded — load remaining bytes to render").size(14));
+				layout = layout.push(
+					text("Partial image data loaded — load remaining bytes to render").size(14),
+				);
 			} else {
 				let handle = ImageHandle::from_memory(state.data.clone());
 				let image_view = Image::new(handle)
@@ -1098,7 +1515,8 @@ impl GuiApp {
 			let (preview, lossy) = file_preview_text(&state.data);
 			let mut preview_column = iced::widget::Column::new().spacing(4);
 			if lossy {
-				preview_column = preview_column.push(text("Binary data - non UTF-8 bytes replaced").size(12));
+				preview_column =
+					preview_column.push(text("Binary data - non UTF-8 bytes replaced").size(12));
 			}
 			preview_column = preview_column.push(text(preview).size(14).width(Length::Fill));
 			layout = layout.push(
@@ -1118,14 +1536,19 @@ impl GuiApp {
 		}
 		let mut controls = iced::widget::Row::new().spacing(12);
 		if !state.eof {
-			let label = if state.loading { "Loading..." } else { "Load more" };
+			let label = if state.loading {
+				"Loading..."
+			} else {
+				"Load more"
+			};
 			let mut load_btn = button(text(label));
 			if !state.loading {
 				load_btn = load_btn.on_press(GuiMessage::FileReadMore);
 			}
 			controls = controls.push(load_btn);
 		}
-		controls = controls.push(button(text("Back to browser")).on_press(GuiMessage::FileViewerBack));
+		controls =
+			controls.push(button(text("Back to browser")).on_press(GuiMessage::FileViewerBack));
 		layout = layout.push(controls);
 		layout.into()
 	}
@@ -1201,29 +1624,59 @@ impl GuiApp {
 		layout = layout.push(
 			pick_list(
 				mime_options,
-				if state.selected_mime.is_empty() { None } else { Some(state.selected_mime.clone()) },
+				if state.selected_mime.is_empty() {
+					None
+				} else {
+					Some(state.selected_mime.clone())
+				},
 				|v| GuiMessage::FileSearchMimeChanged(v),
 			)
 			.placeholder("(any mime type)"),
 		);
 		// sort toggle
-		let sort_label = if state.sort_desc { "Sort: Latest ↓" } else { "Sort: Latest ↑" };
+		let sort_label = if state.sort_desc {
+			"Sort: Latest ↓"
+		} else {
+			"Sort: Latest ↑"
+		};
 		let controls_row = iced::widget::Row::new()
 			.spacing(12)
 			.push(button(text(sort_label)).on_press(GuiMessage::FileSearchToggleSort))
 			.push(button(text("Search")).on_press(GuiMessage::FileSearchExecute));
 		layout = layout.push(controls_row);
-		if state.loading { return layout.push(text("Searching...")) .into(); }
-		if let Some(err) = &state.error { return layout.push(text(format!("Error: {}", err))).into(); }
-		if state.results.is_empty() { return layout.push(text("No results (run a search)")).into(); }
+		if state.loading {
+			return layout.push(text("Searching...")).into();
+		}
+		if let Some(err) = &state.error {
+			return layout.push(text(format!("Error: {}", err))).into();
+		}
+		if state.results.is_empty() {
+			return layout.push(text("No results (run a search)")).into();
+		}
 		let mut list = iced::widget::Column::new().spacing(4);
 		for entry in &state.results {
 			let row = iced::widget::Row::new()
 				.spacing(8)
-				.push(text(&abbreviate_hash(&entry.hash)).size(14).width(Length::FillPortion(2)))
-				.push(text(entry.mime_type.clone().unwrap_or_else(|| "?".into())).size(14).width(Length::FillPortion(2)))
-				.push(text(format_size(entry.size)).size(14).width(Length::FillPortion(1)))
-				.push(text(entry.latest.clone()).size(14).width(Length::FillPortion(2)));
+				.push(
+					text(&abbreviate_hash(&entry.hash))
+						.size(14)
+						.width(Length::FillPortion(2)),
+				)
+				.push(
+					text(entry.mime_type.clone().unwrap_or_else(|| "?".into()))
+						.size(14)
+						.width(Length::FillPortion(2)),
+				)
+				.push(
+					text(format_size(entry.size))
+						.size(14)
+						.width(Length::FillPortion(1)),
+				)
+				.push(
+					text(entry.latest.clone())
+						.size(14)
+						.width(Length::FillPortion(2)),
+				);
 			list = list.push(container(row).padding(4).style(theme::Container::Box));
 		}
 		layout.push(scrollable(list).height(Length::Fill)).into()
@@ -1353,8 +1806,17 @@ fn abbreviate_peer_id(id: &str) -> String {
 }
 
 fn abbreviate_hash(hash_hex: &str) -> String {
-	const PREFIX: usize = 8; const SUFFIX: usize = 8;
-	if hash_hex.len() <= PREFIX + SUFFIX + 1 { hash_hex.to_string() } else { format!("{}…{}", &hash_hex[..PREFIX], &hash_hex[hash_hex.len()-SUFFIX..]) }
+	const PREFIX: usize = 8;
+	const SUFFIX: usize = 8;
+	if hash_hex.len() <= PREFIX + SUFFIX + 1 {
+		hash_hex.to_string()
+	} else {
+		format!(
+			"{}…{}",
+			&hash_hex[..PREFIX],
+			&hash_hex[hash_hex.len() - SUFFIX..]
+		)
+	}
 }
 
 fn normalize_path(path: &str) -> String {
